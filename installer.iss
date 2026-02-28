@@ -46,18 +46,18 @@ Name: "turkish"; MessagesFile: "compiler:Languages\Turkish.isl"
 Name: "ukrainian"; MessagesFile: "compiler:Languages\Ukrainian.isl"
 
 [Files]
-Source: "dist\BaiduDownloader.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "dist\BaiduyunDownloader.exe"; DestDir: "{app}"; DestName: "BaiduyunDownloader.exe"; Flags: ignoreversion
 
 [Icons]
-Name: "{group}\Baidu Cloud Downloader"; Filename: "{app}\BaiduDownloader.exe"
+Name: "{group}\Baidu Cloud Downloader"; Filename: "{app}\BaiduyunDownloader.exe"
 Name: "{group}\Uninstall Baidu Cloud Downloader"; Filename: "{uninstallexe}"
-Name: "{autodesktop}\Baidu Cloud Downloader"; Filename: "{app}\BaiduDownloader.exe"; Tasks: desktopicon
+Name: "{autodesktop}\Baidu Cloud Downloader"; Filename: "{app}\BaiduyunDownloader.exe"; Tasks: desktopicon
 
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"
 
 [Run]
-Filename: "{app}\BaiduDownloader.exe"; Description: "{cm:LaunchProgram,Baidu Cloud Downloader}"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\BaiduyunDownloader.exe"; Description: "{cm:LaunchProgram,Baidu Cloud Downloader}"; Flags: nowait postinstall skipifsilent
 
 [Code]
 function GetAppLang: String;

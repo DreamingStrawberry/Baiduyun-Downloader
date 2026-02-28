@@ -439,7 +439,11 @@ def _download_sequential(bduss, remote_path, output_path, total_size,
                                     r.close()
                                     return False
                                 time.sleep(0.2)
-                            f.write(piece)
+                            try:
+                                f.write(piece)
+                            except OSError:
+                                r.close()
+                                return False
                             downloaded += len(piece)
                             chunk_downloaded += len(piece)
                             # 0.5초마다 속도 계산 및 콜백
@@ -459,7 +463,10 @@ def _download_sequential(bduss, remote_path, output_path, total_size,
                                 actual = now - chunk_start
                                 if expected > actual:
                                     time.sleep(min(expected - actual, 0.5))
-                        f.flush()
+                        try:
+                            f.flush()
+                        except OSError:
+                            return False
                         success = True
                         break
                     elif r.status_code == 403:
@@ -594,9 +601,14 @@ def _download_parallel(bduss, remote_path, output_path, total_size,
                                 r.close()
                                 results[seg_id] = False
                                 return
-                            with file_lock:
-                                fp.seek(pos)
-                                fp.write(piece)
+                            try:
+                                with file_lock:
+                                    fp.seek(pos)
+                                    fp.write(piece)
+                            except OSError:
+                                r.close()
+                                results[seg_id] = False
+                                return
                             pos += len(piece)
                             chunk_downloaded += len(piece)
                             with progress_lock:
@@ -608,8 +620,12 @@ def _download_parallel(bduss, remote_path, output_path, total_size,
                                 actual = time.time() - chunk_start
                                 if expected > actual:
                                     time.sleep(min(expected - actual, 0.5))
-                        with file_lock:
-                            fp.flush()
+                        try:
+                            with file_lock:
+                                fp.flush()
+                        except OSError:
+                            results[seg_id] = False
+                            return
                         success = True
                         break
                     elif r.status_code == 403:
