@@ -1790,7 +1790,7 @@ if HAS_GUI:
             self.pconn_warn.setWordWrap(True)
             self.pconn_warn.setVisible(cur_pconn >= 16)
             self.pconn_spin.valueChanged.connect(
-                lambda v: self.pconn_warn.setVisible(v >= 16))
+                lambda v: (self.pconn_warn.setVisible(v >= 16), self.adjustSize()))
             pconn_layout.addWidget(pconn_desc)
             pconn_layout.addWidget(self.pconn_warn)
             layout.addRow(tr("parallel_conn"), pconn_layout)
@@ -1818,7 +1818,7 @@ if HAS_GUI:
             self.conc_warn.setWordWrap(True)
             self.conc_warn.setVisible(cur_conc >= 4)
             self.conc_spin.valueChanged.connect(
-                lambda v: self.conc_warn.setVisible(v >= 4))
+                lambda v: (self.conc_warn.setVisible(v >= 4), self.adjustSize()))
             conc_layout.addWidget(conc_desc)
             conc_layout.addWidget(self.conc_warn)
             layout.addRow(tr("concurrent_files"), conc_layout)
