@@ -9,6 +9,7 @@ import os
 import json
 import time
 import math
+import hashlib
 import urllib.parse
 import argparse
 import requests
@@ -25,6 +26,7 @@ SPEED_LIMIT_BAIDU = 0         # Baidu 속도 제한 (bytes/s)
 SPEED_LIMIT_BILI  = 0         # Bilibili 속도 제한 (bytes/s)
 SPEED_LIMIT_QUARK = 0         # Quark 속도 제한 (bytes/s)
 UA = "netdisk;2.2.51.6;netdisk;10.0.63;PC;PC-Windows;6.2.9200;WindowsBaiduYunGuanJia"
+UA_DL = "netdisk;f4pan"  # dlink download User-Agent (higher speed)
 APP_ID = 778750
 PCS_BASE = "https://pcs.baidu.com/rest/2.0/pcs/file"
 PAN_BASE = "https://pan.baidu.com"
@@ -314,6 +316,90 @@ def get_redirect_url(bduss, remote_path, session=None):
     return None
 
 
+def get_fs_id(bduss, remote_path):
+    """remote_path에 대한 fs_id 조회"""
+    s = make_session(bduss)
+    params = {
+        "method": "filemetas",
+        "fsids": "[]",
+        "path": remote_path,
+        "channel": "chunlei",
+        "web": 1,
+        "clienttype": 0,
+    }
+    # list API로 파일 정보 획득 (fs_id 포함)
+    dir_path = "/".join(remote_path.replace("\\", "/").split("/")[:-1]) or "/"
+    fname = remote_path.split("/")[-1]
+    r = s.get(f"{PAN_BASE}/api/list", params={
+        "dir": dir_path, "num": 1000, "order": "name",
+        "channel": "chunlei", "web": 1, "clienttype": 0,
+    }, timeout=15)
+    data = r.json()
+    for item in data.get("list", []):
+        if item.get("server_filename") == fname or item.get("path") == remote_path:
+            return item.get("fs_id")
+    return None
+
+
+def get_dlink(bduss, remote_path, session=None):
+    """locatedownload API로 고속 dlink 획득 (BDUSS 기반, 서명 포함)"""
+    s = session or make_session(bduss)
+    timestamp = str(int(time.time() * 1000))
+    devuid = "0|" + hashlib.md5(bduss.encode()).hexdigest().upper()
+    enc = hashlib.sha1(bduss.encode()).hexdigest()
+    # uid 획득
+    try:
+        r = s.get(f"{PAN_BASE}/rest/2.0/xpan/nas?method=uinfo", timeout=10)
+        uid = str(r.json().get("uk", "0"))
+    except Exception:
+        uid = "0"
+    rand = hashlib.sha1(
+        (enc + uid + "ebrcUYiuxaZv2XGu7KIYKxUrqfnOfpDF" + timestamp + devuid).encode()
+    ).hexdigest()
+
+    encoded_path = urllib.parse.quote(remote_path, safe="")
+    url = (f"{PCS_BASE}?method=locatedownload&app_id={APP_ID}&ver=2"
+           f"&path={encoded_path}&time={timestamp}&rand={rand}&devuid={devuid}")
+    try:
+        r = s.get(url, timeout=30)
+        data = r.json()
+        urls = data.get("urls")
+        if urls and len(urls) > 0:
+            return urls[0].get("url")
+    except Exception:
+        pass
+
+    # locatedownload 실패 → filemetas dlink 시도
+    try:
+        fs_id = get_fs_id(bduss, remote_path)
+        if fs_id:
+            r = s.get(f"{PAN_BASE}/rest/2.0/xpan/multimedia", params={
+                "method": "filemetas",
+                "fsids": json.dumps([fs_id]),
+                "dlink": 1,
+                "channel": "chunlei",
+                "web": 1,
+                "clienttype": 0,
+            }, timeout=15)
+            data = r.json()
+            items = data.get("list", [])
+            if items and items[0].get("dlink"):
+                return items[0]["dlink"]
+    except Exception:
+        pass
+
+    return None
+
+
+def get_download_url(bduss, remote_path, session=None):
+    """고속 dlink 우선 시도 → 실패 시 PCS redirect URL 폴백"""
+    url = get_dlink(bduss, remote_path, session=session)
+    if url:
+        return url, True  # (url, is_dlink)
+    url = get_redirect_url(bduss, remote_path, session=session)
+    return url, False  # (url, is_dlink)
+
+
 # ── 다운로드 엔진 ─────────────────────────────────────────────────────────────
 
 def format_size(n):
@@ -388,7 +474,8 @@ def _download_sequential(bduss, remote_path, output_path, total_size,
             print(msg)
 
     chunk_idx = 0
-    redirect_url = None
+    dl_url = None
+    _is_dlink = False
     start_time = time.time()
     speed = 0
     _last_speed_time = start_time
@@ -406,21 +493,21 @@ def _download_sequential(bduss, remote_path, output_path, total_size,
                     return False
                 time.sleep(0.2)
 
-            if redirect_url is None or chunk_idx % CHUNKS_PER_URL == 0:
+            if dl_url is None or chunk_idx % CHUNKS_PER_URL == 0:
                 for attempt in range(MAX_RETRY):
-                    redirect_url = get_redirect_url(bduss, remote_path)
-                    if redirect_url:
+                    dl_url, _is_dlink = get_download_url(bduss, remote_path)
+                    if dl_url:
                         break
-                    _print(f"\n  redirect URL 재시도 ({attempt+1}/{MAX_RETRY})...")
+                    _print(f"\n  URL retry ({attempt+1}/{MAX_RETRY})...")
                     time.sleep(2 ** attempt)
-                if not redirect_url:
-                    _print("\n  redirect URL 획득 실패. 다운로드 중단.")
+                if not dl_url:
+                    _print("\n  URL fetch failed. Download aborted.")
                     return False
 
             start = downloaded
             end = min(downloaded + CHUNK_SIZE - 1, total_size - 1)
             headers = {
-                "User-Agent": UA,
+                "User-Agent": UA_DL if _is_dlink else UA,
                 "Range": f"bytes={start}-{end}",
             }
 
@@ -473,9 +560,9 @@ def _download_sequential(bduss, remote_path, output_path, total_size,
                         success = True
                         break
                     elif r.status_code == 403:
-                        redirect_url = get_redirect_url(bduss, remote_path)
-                        if not redirect_url:
-                            _print(f"\n  URL 갱신 실패")
+                        dl_url, _is_dlink = get_download_url(bduss, remote_path)
+                        if not dl_url:
+                            _print(f"\n  URL refresh failed")
                             break
                     else:
                         _print(f"\n  HTTP {r.status_code}, 재시도 ({attempt+1}/{MAX_RETRY})")
@@ -552,8 +639,8 @@ def _download_parallel(bduss, remote_path, output_path, total_size,
         """세그먼트 워커: 할당된 범위를 독립적으로 다운로드"""
         sess = make_session(bduss)  # 세그먼트별 세션 재사용
         dl_sess = requests.Session()
-        dl_sess.headers["User-Agent"] = UA
-        redirect_url = None
+        dl_url = None
+        _is_dlink = False
         chunk_idx = 0
         pos = seg_start
 
@@ -569,23 +656,23 @@ def _download_parallel(bduss, remote_path, output_path, total_size,
                     return
                 time.sleep(0.2)
 
-            # redirect URL 갱신 (세그먼트별 독립)
-            if redirect_url is None or chunk_idx % CHUNKS_PER_URL == 0:
+            # URL 갱신 (세그먼트별 독립): dlink 우선
+            if dl_url is None or chunk_idx % CHUNKS_PER_URL == 0:
                 for attempt in range(MAX_RETRY):
                     try:
-                        redirect_url = get_redirect_url(bduss, remote_path, session=sess)
+                        dl_url, _is_dlink = get_download_url(bduss, remote_path, session=sess)
                     except Exception:
-                        redirect_url = None
-                    if redirect_url:
+                        dl_url = None
+                    if dl_url:
                         break
                     time.sleep(2 ** attempt)
-                if not redirect_url:
+                if not dl_url:
                     results[seg_id] = False
                     return
 
             end = min(pos + CHUNK_SIZE - 1, seg_end - 1)
             headers = {
-                "User-Agent": UA,
+                "User-Agent": UA_DL if _is_dlink else UA,
                 "Range": f"bytes={pos}-{end}",
             }
 
@@ -597,7 +684,7 @@ def _download_parallel(bduss, remote_path, output_path, total_size,
                 try:
                     chunk_start = time.time()
                     chunk_downloaded = 0
-                    r = dl_sess.get(redirect_url, headers=headers, timeout=60, stream=True)
+                    r = dl_sess.get(dl_url, headers=headers, timeout=60, stream=True)
                     if r.status_code in (200, 206):
                         for piece in r.iter_content(chunk_size=65536):
                             if cancel_flag and cancel_flag():
@@ -632,8 +719,8 @@ def _download_parallel(bduss, remote_path, output_path, total_size,
                         success = True
                         break
                     elif r.status_code == 403:
-                        redirect_url = get_redirect_url(bduss, remote_path, session=sess)
-                        if not redirect_url:
+                        dl_url, _is_dlink = get_download_url(bduss, remote_path, session=sess)
+                        if not dl_url:
                             break
                     else:
                         time.sleep(2 ** attempt)
