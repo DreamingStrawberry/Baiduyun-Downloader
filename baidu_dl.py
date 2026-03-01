@@ -60,7 +60,7 @@ EMA_ALPHA = 0.25                  # EMA 가중치
 try:
     from PySide6.QtWidgets import (
         QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-        QTreeWidget, QTreeWidgetItem, QHeaderView, QLabel, QProgressBar,
+        QTreeWidget, QTreeWidgetItem, QHeaderView, QLabel, QProgressBar, QProgressDialog,
         QPushButton, QToolBar, QDialog, QFormLayout, QLineEdit, QTextEdit,
         QFileDialog, QMessageBox, QStatusBar, QSizePolicy, QStyle,
         QSplitter, QMenu, QMenuBar, QCheckBox, QSystemTrayIcon, QComboBox, QStyledItemDelegate,
@@ -5674,16 +5674,28 @@ if HAS_GUI:
             self._start_update_download(dl_url)
 
         def _start_update_download(self, dl_url):
-            """새 exe 다운로드 시작 (공통)"""
+            """새 exe 다운로드 시작 (공통) — QProgressDialog로 진행률 표시"""
             import tempfile
             tmp_path = os.path.join(tempfile.gettempdir(), "BaiduyunDownloader_new.exe")
-            self.status.showMessage(tr("updating"))
+            self._update_progress = QProgressDialog(tr("updating"), tr("cancel"), 0, 100, self)
+            self._update_progress.setWindowTitle(tr("update_available"))
+            self._update_progress.setWindowModality(Qt.WindowModality.WindowModal)
+            self._update_progress.setMinimumWidth(350)
+            self._update_progress.setAutoClose(False)
+            self._update_progress.setValue(0)
+            self._update_progress.show()
             self._update_dl_worker = UpdateDownloadWorker(dl_url, tmp_path)
-            self._update_dl_worker.progress.connect(
-                lambda p: self.status.showMessage(f"{tr('updating')} {p}%"))
+            self._update_dl_worker.progress.connect(self._update_progress.setValue)
             self._update_dl_worker.finished.connect(
                 lambda ok, path: self._on_update_downloaded(ok, path))
+            self._update_progress.canceled.connect(self._cancel_update_download)
             self._update_dl_worker.start()
+
+        def _cancel_update_download(self):
+            """업데이트 다운로드 취소"""
+            if hasattr(self, '_update_dl_worker') and self._update_dl_worker.isRunning():
+                self._update_dl_worker.terminate()
+            self.status.showMessage(tr("ready"))
 
         def _show_update_dialog(self):
             """상단 바 클릭 시 업데이트 확인 다이얼로그 표시"""
@@ -5704,6 +5716,8 @@ if HAS_GUI:
             self._pending_update_info = None
 
         def _on_update_downloaded(self, ok, path):
+            if hasattr(self, '_update_progress'):
+                self._update_progress.close()
             if not ok:
                 QMessageBox.warning(self, tr("update_available"),
                     tr("update_fail", e=path))
@@ -5724,8 +5738,16 @@ if HAS_GUI:
                 bat = os.path.join(os.path.dirname(new_path), "_update.bat")
                 with open(bat, "w", encoding="utf-8") as f:
                     f.write('@echo off\n')
-                    f.write('timeout /t 2 /nobreak >nul\n')
-                    f.write(f'move /y "{new_path}" "{exe_path}"\n')
+                    f.write('setlocal\n')
+                    f.write('set RETRIES=0\n')
+                    f.write(':WAIT_LOOP\n')
+                    f.write('timeout /t 1 /nobreak >nul\n')
+                    f.write(f'move /y "{new_path}" "{exe_path}" >nul 2>&1\n')
+                    f.write('if errorlevel 1 (\n')
+                    f.write('  set /a RETRIES+=1\n')
+                    f.write('  if %RETRIES% lss 10 goto WAIT_LOOP\n')
+                    f.write('  exit /b 1\n')
+                    f.write(')\n')
                     f.write(f'start "" "{exe_path}"\n')
                     f.write('del "%~f0"\n')
                 import subprocess
