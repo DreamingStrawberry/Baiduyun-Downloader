@@ -4160,8 +4160,6 @@ if HAS_GUI:
             self.logout_btn.setVisible(True)
             self._load_files("/")
             self._refresh_quota()
-            # 시작 시 자동 업데이트 체크 (조용히)
-            self._check_update(silent=True)
 
         def _switch_to_verify_btn(self):
             """버튼을 '인증'으로 전환"""
@@ -6044,6 +6042,8 @@ def main_gui():
     window.raise_()
     window.activateWindow()
 
+    # 시작 시 자동 업데이트 체크 (조용히)
+    window._check_update(silent=True)
     # 비동기 자동 로그인
     window._try_auto_login()
 
