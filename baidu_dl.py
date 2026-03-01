@@ -5730,8 +5730,9 @@ if HAS_GUI:
                     f.write('del "%~f0"\n')
                 import subprocess
                 subprocess.Popen(["cmd", "/c", bat],
-                    creationflags=0x00000008)  # DETACHED_PROCESS
-                QApplication.quit()
+                    creationflags=0x08000000)  # CREATE_NO_WINDOW
+                self._really_quit = True
+                self.close()
 
 
 # ── 메인 ──────────────────────────────────────────────────────────────────────
