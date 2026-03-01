@@ -2,7 +2,7 @@
 
 [Setup]
 AppName=Baidu Cloud Downloader
-AppVersion=1.0
+AppVersion=1.2.0
 AppPublisher=Baidu Downloader
 DefaultDirName={autopf}\BaiduDownloader
 DefaultGroupName=Baidu Cloud Downloader

@@ -8,8 +8,10 @@ def main():
         sys.executable, "-m", "PyInstaller",
         "--onefile",
         "--windowed",
-        "--name", "BaiduDownloader",
+        "--name", "BaiduyunDownloader",
         "--noconfirm",
+        "--icon", "app_icon.ico",
+        "--add-data", "app_icon.ico;.",
         "--exclude-module", "playwright",
         "baidu_dl.py",
     ]
