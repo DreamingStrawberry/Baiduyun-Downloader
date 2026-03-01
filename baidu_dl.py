@@ -15,12 +15,15 @@ import requests
 import threading
 
 # ── 상수 ──────────────────────────────────────────────────────────────────────
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 GITHUB_REPO = "owner/baidu-downloader"  # ← GitHub 레포 만들면 여기만 수정
 CHUNK_SIZE = 2 * 1024 * 1024  # 2MB
 PARALLEL_CONN = 8             # 파일당 동시 연결 수 (기본 8)
 MAX_CONCURRENT = 2            # 동시 다운로드 파일 수 (기본 2)
-SPEED_LIMIT = 0               # 속도 제한 (bytes/s), 0=무제한
+SPEED_LIMIT = 0               # 속도 제한 (bytes/s), 0=무제한 (SPEED_LIMIT_BAIDU alias)
+SPEED_LIMIT_BAIDU = 0         # Baidu 속도 제한 (bytes/s)
+SPEED_LIMIT_BILI  = 0         # Bilibili 속도 제한 (bytes/s)
+SPEED_LIMIT_QUARK = 0         # Quark 속도 제한 (bytes/s)
 UA = "netdisk;2.2.51.6;netdisk;10.0.63;PC;PC-Windows;6.2.9200;WindowsBaiduYunGuanJia"
 APP_ID = 778750
 PCS_BASE = "https://pcs.baidu.com/rest/2.0/pcs/file"
@@ -458,8 +461,8 @@ def _download_sequential(bduss, remote_path, output_path, total_size,
                                 else:
                                     progress_bar(downloaded, total_size, speed=speed)
                             # 속도 제한 (64KB 단위)
-                            if SPEED_LIMIT > 0:
-                                expected = chunk_downloaded / SPEED_LIMIT
+                            if SPEED_LIMIT_BAIDU > 0:
+                                expected = chunk_downloaded / SPEED_LIMIT_BAIDU
                                 actual = now - chunk_start
                                 if expected > actual:
                                     time.sleep(min(expected - actual, 0.5))
@@ -614,8 +617,8 @@ def _download_parallel(bduss, remote_path, output_path, total_size,
                             with progress_lock:
                                 seg_progress[seg_id] = pos - seg_start
                             # 속도 제한 (스레드별, 64KB 단위)
-                            if SPEED_LIMIT > 0:
-                                per_thread_limit = SPEED_LIMIT / num_conn
+                            if SPEED_LIMIT_BAIDU > 0:
+                                per_thread_limit = SPEED_LIMIT_BAIDU / num_conn
                                 expected = chunk_downloaded / per_thread_limit if per_thread_limit > 0 else 0
                                 actual = time.time() - chunk_start
                                 if expected > actual:
@@ -676,6 +679,556 @@ def _download_parallel(bduss, remote_path, output_path, total_size,
     if not ok:
         _print("  일부 세그먼트 다운로드 실패.")
     return ok
+
+
+# ── Bilibili 다운로드 ─────────────────────────────────────────────────────────
+
+import hashlib
+import re
+
+_BILI_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
+_BILI_REFERER = "https://www.bilibili.com/"
+
+_WBI_MIXIN_KEY_ENC_TAB = [
+    46, 47, 18, 2, 53, 8, 23, 32, 15, 50, 10, 31, 58, 3, 45, 35, 27, 43, 5, 49,
+    33, 9, 42, 19, 29, 28, 14, 39, 12, 38, 41, 13, 37, 48, 7, 16, 24, 55, 40,
+    61, 26, 17, 0, 1, 60, 51, 30, 4, 22, 25, 54, 21, 56, 59, 6, 63, 57, 62, 11,
+    36, 20, 34, 44, 52,
+]
+
+_wbi_key_cache = {"key": None, "ts": 0}
+
+
+def _bili_session():
+    s = requests.Session()
+    s.headers["User-Agent"] = _BILI_UA
+    s.headers["Referer"] = _BILI_REFERER
+    return s
+
+
+def _get_wbi_key(session=None):
+    """WBI 서명 키 획득 (캐시 10분)"""
+    now = time.time()
+    if _wbi_key_cache["key"] and now - _wbi_key_cache["ts"] < 600:
+        return _wbi_key_cache["key"]
+    s = session or _bili_session()
+    r = s.get("https://api.bilibili.com/x/web-interface/nav", timeout=10)
+    data = r.json().get("data", {})
+    wbi = data.get("wbi_img", {})
+    img_url = wbi.get("img_url", "")
+    sub_url = wbi.get("sub_url", "")
+    img_key = img_url.rsplit("/", 1)[-1].split(".")[0]
+    sub_key = sub_url.rsplit("/", 1)[-1].split(".")[0]
+    lookup = img_key + sub_key
+    wbi_key = "".join(lookup[i] for i in _WBI_MIXIN_KEY_ENC_TAB if i < len(lookup))[:32]
+    _wbi_key_cache["key"] = wbi_key
+    _wbi_key_cache["ts"] = now
+    return wbi_key
+
+
+def _sign_wbi(params, wbi_key):
+    """WBI 서명 적용"""
+    params["wts"] = str(round(time.time()))
+    cleaned = {}
+    for k, v in sorted(params.items()):
+        cleaned[k] = str(v).translate({ord(c): "" for c in "!'()*"})
+    query = urllib.parse.urlencode(cleaned)
+    params["w_rid"] = hashlib.md5((query + wbi_key).encode()).hexdigest()
+    return params
+
+
+def bili_parse_url(url):
+    """Bilibili URL에서 BV/AV ID 추출 → bvid 문자열"""
+    m = re.search(r"bilibili\.com/video/([ABab][Vv][a-zA-Z0-9]+)", url)
+    if m:
+        return m.group(1)
+    m = re.search(r"bilibili\.com/video/av(\d+)", url)
+    if m:
+        return None  # av ID는 별도 처리 필요 — 일단 BV만 지원
+    m = re.search(r"bvid=([ABab][Vv][a-zA-Z0-9]+)", url)
+    if m:
+        return m.group(1)
+    return None
+
+
+def bili_get_video_info(bvid, session=None):
+    """비디오 정보 조회 → dict(title, cid, aid, pages, pic, duration)"""
+    s = session or _bili_session()
+    r = s.get("https://api.bilibili.com/x/web-interface/view",
+              params={"bvid": bvid}, timeout=10)
+    data = r.json()
+    if data.get("code") != 0:
+        return None
+    d = data["data"]
+    return {
+        "bvid": d["bvid"],
+        "aid": d["aid"],
+        "title": d.get("title", ""),
+        "pic": d.get("pic", ""),
+        "duration": d.get("duration", 0),
+        "cid": d["cid"],
+        "pages": d.get("pages", []),
+    }
+
+
+def bili_get_streams(bvid, cid, session=None, sessdata=None):
+    """DASH 스트림 URL 획득 → dict(video=[], audio=[])
+    sessdata: SESSDATA 쿠키 값 (VIP 계정이면 4K 가능)
+    """
+    s = session or _bili_session()
+    if sessdata:
+        s.cookies.set("SESSDATA", sessdata, domain=".bilibili.com")
+    wbi_key = _get_wbi_key(s)
+    params = {
+        "bvid": bvid,
+        "cid": str(cid),
+        "fnval": "4048",
+        "fourk": "1",
+        "qn": "127",
+    }
+    if not sessdata:
+        params["try_look"] = "1"
+    params = _sign_wbi(params, wbi_key)
+    r = s.get("https://api.bilibili.com/x/player/wbi/playurl",
+              params=params, timeout=10)
+    data = r.json()
+    if data.get("code") != 0:
+        return None
+    dash = data.get("data", {}).get("dash")
+    if not dash:
+        return None
+    videos = []
+    for v in dash.get("video", []):
+        videos.append({
+            "qn": v.get("id", 0),
+            "codec": v.get("codecs", ""),
+            "width": v.get("width", 0),
+            "height": v.get("height", 0),
+            "bandwidth": v.get("bandwidth", 0),
+            "url": v.get("baseUrl") or v.get("base_url", ""),
+            "backup": v.get("backupUrl") or v.get("backup_url", []),
+            "size": v.get("size", 0),
+        })
+    audios = []
+    for a in dash.get("audio", []):
+        audios.append({
+            "id": a.get("id", 0),
+            "codec": a.get("codecs", ""),
+            "bandwidth": a.get("bandwidth", 0),
+            "url": a.get("baseUrl") or a.get("base_url", ""),
+            "backup": a.get("backupUrl") or a.get("backup_url", []),
+            "size": a.get("size", 0),
+        })
+    return {"video": videos, "audio": audios,
+            "quality": data["data"].get("quality", 0),
+            "accept_quality": data["data"].get("accept_quality", [])}
+
+
+def _bili_qn_label(qn):
+    labels = {6: "240P", 16: "360P", 32: "480P", 64: "720P",
+              74: "720P60", 80: "1080P", 112: "1080P+",
+              116: "1080P60", 120: "4K", 125: "HDR", 126: "Dolby", 127: "8K"}
+    return labels.get(qn, f"{qn}")
+
+
+# ── Bilibili gRPC (모바일 APP API) — 트라이얼 4K ────────────────────────────
+
+def _pb_varint(value):
+    """Protobuf varint 인코딩"""
+    buf = bytearray()
+    while value > 0x7F:
+        buf.append((value & 0x7F) | 0x80)
+        value >>= 7
+    buf.append(value & 0x7F)
+    return bytes(buf)
+
+def _pb_field(field_num, wire_type, data):
+    """Protobuf 필드 인코딩"""
+    tag = _pb_varint((field_num << 3) | wire_type)
+    if wire_type == 0:  # varint
+        return tag + _pb_varint(data)
+    elif wire_type == 2:  # length-delimited
+        if isinstance(data, str):
+            data = data.encode("utf-8")
+        return tag + _pb_varint(len(data)) + data
+    return tag + data
+
+def _pb_read_varint(buf, pos):
+    """Protobuf varint 디코딩"""
+    result = 0
+    shift = 0
+    while pos < len(buf):
+        b = buf[pos]
+        result |= (b & 0x7F) << shift
+        pos += 1
+        if not (b & 0x80):
+            break
+        shift += 7
+    return result, pos
+
+def _pb_parse(buf):
+    """간단한 protobuf 메시지 파싱 → {field_num: [(wire_type, value), ...]}"""
+    fields = {}
+    pos = 0
+    while pos < len(buf):
+        tag, pos = _pb_read_varint(buf, pos)
+        field_num = tag >> 3
+        wire_type = tag & 0x07
+        if wire_type == 0:  # varint
+            val, pos = _pb_read_varint(buf, pos)
+        elif wire_type == 2:  # length-delimited
+            length, pos = _pb_read_varint(buf, pos)
+            val = buf[pos:pos + length]
+            pos += length
+        elif wire_type == 5:  # 32-bit
+            val = buf[pos:pos + 4]
+            pos += 4
+        elif wire_type == 1:  # 64-bit
+            val = buf[pos:pos + 8]
+            pos += 8
+        else:
+            break
+        fields.setdefault(field_num, []).append((wire_type, val))
+    return fields
+
+def _pb_get_varint(fields, num, default=0):
+    """파싱된 필드에서 varint 값 가져오기"""
+    for wt, val in fields.get(num, []):
+        if wt == 0:
+            return val
+    return default
+
+def _pb_get_bytes(fields, num, default=b""):
+    """파싱된 필드에서 bytes 값 가져오기"""
+    for wt, val in fields.get(num, []):
+        if wt == 2:
+            return val
+    return default
+
+def _pb_get_string(fields, num, default=""):
+    b = _pb_get_bytes(fields, num)
+    return b.decode("utf-8", errors="replace") if b else default
+
+def _pb_get_all(fields, num):
+    """파싱된 필드에서 해당 번호의 모든 값 리스트"""
+    return [(wt, val) for wt, val in fields.get(num, [])]
+
+
+def _bili_grpc_metadata():
+    """gRPC 메타데이터 바이너리 헤더 생성 (비로그인)"""
+    import base64, uuid
+    buvid = str(uuid.uuid4()).upper()
+    # x-bili-metadata-bin: Metadata protobuf
+    # field 5: mobi_app="android", field 6: device="android",
+    # field 8: build=7320200, field 9: channel="master",
+    # field 11: buvid=<uuid>, field 12: platform="android"
+    meta = (
+        _pb_field(5, 2, "android") +
+        _pb_field(6, 2, "android") +
+        _pb_field(8, 0, 7320200) +
+        _pb_field(9, 2, "master") +
+        _pb_field(11, 2, buvid) +
+        _pb_field(12, 2, "android")
+    )
+    # x-bili-device-bin: Device protobuf
+    # field 1: brand, field 2: model, field 3: os_ver,
+    # field 5: build=7320200
+    dev = (
+        _pb_field(1, 2, "Xiaomi") +
+        _pb_field(2, 2, "M2012K11AC") +
+        _pb_field(3, 2, "11") +
+        _pb_field(5, 0, 7320200)
+    )
+    # x-bili-fawkes-req-bin: Fawkes protobuf
+    # field 1: app_key="android64", field 2: env="prod"
+    fawkes = (
+        _pb_field(1, 2, "android64") +
+        _pb_field(2, 2, "prod")
+    )
+    return {
+        "x-bili-metadata-bin": base64.b64encode(meta).decode(),
+        "x-bili-device-bin": base64.b64encode(dev).decode(),
+        "x-bili-fawkes-req-bin": base64.b64encode(fawkes).decode(),
+    }
+
+
+def _grpc_wrap(payload):
+    """gRPC 페이로드 래핑 (5바이트 헤더: 압축 플래그 + 길이)"""
+    import struct
+    return struct.pack(">BI", 0, len(payload)) + payload
+
+def _grpc_unwrap(data):
+    """gRPC 응답에서 페이로드 추출"""
+    import struct
+    if len(data) < 5:
+        return None
+    compressed, length = struct.unpack(">BI", data[:5])
+    return data[5:5 + length]
+
+
+def bili_get_streams_grpc(aid, cid):
+    """gRPC PlayViewUnite API로 4K 트라이얼 스트림 획득
+
+    서버가 트라이얼 4K URL을 실제 반환 → 30초 제한은 클라이언트측만 강제
+    → 다운로더는 전체 파일 다운로드 가능
+    """
+    try:
+        import httpx
+    except ImportError:
+        return None
+
+    # PlayViewUniteReq 구성
+    # VideoVod 메시지 (field 1 of PlayViewUniteReq)
+    vod = (
+        _pb_field(1, 0, int(aid)) +   # aid
+        _pb_field(2, 0, int(cid)) +   # cid
+        _pb_field(3, 0, 127) +        # qn = 127 (8K, 최고 요청)
+        _pb_field(4, 0, 0) +          # fnver
+        _pb_field(5, 0, 4048) +       # fnval = DASH + 모든 옵션
+        _pb_field(8, 0, 1) +          # fourk = true
+        _pb_field(10, 0, 2)           # prefer_codec_type = HEVC(2), AVC(0)
+    )
+    req = _pb_field(1, 2, vod)  # field 1 = vod (VideoVod 메시지)
+
+    grpc_body = _grpc_wrap(req)
+
+    meta = _bili_grpc_metadata()
+    headers = {
+        "content-type": "application/grpc",
+        "user-agent": "Dalvik/2.1.0 (Linux; U; Android 11; M2012K11AC Build/RKQ1.200826.002) 7.32.0 os/android model/M2012K11AC mobi_app/android build/7320200 channel/master innerVer/7320200 osVer/11 network/2",
+        "te": "trailers",
+        "x-bili-metadata-bin": meta["x-bili-metadata-bin"],
+        "x-bili-device-bin": meta["x-bili-device-bin"],
+        "x-bili-fawkes-req-bin": meta["x-bili-fawkes-req-bin"],
+    }
+
+    url = "https://grpc.biliapi.net/bilibili.app.playerunite.v1.Player/PlayViewUnite"
+
+    try:
+        with httpx.Client(http2=True, timeout=15) as client:
+            resp = client.post(url, content=grpc_body, headers=headers)
+            if resp.status_code != 200:
+                return None
+            body = _grpc_unwrap(resp.content)
+            if not body:
+                return None
+    except Exception:
+        return None
+
+    return _parse_grpc_play_reply(body)
+
+
+def _parse_grpc_play_reply(body):
+    """PlayViewUniteReply protobuf 파싱 → streams dict"""
+    reply = _pb_parse(body)
+
+    # field 1 = vod_info (VideoInfo)
+    vod_bytes = _pb_get_bytes(reply, 1)
+    if not vod_bytes:
+        return None
+
+    vod = _pb_parse(vod_bytes)
+
+    # VideoInfo: field 2 = stream_list (repeated Stream)
+    stream_entries = _pb_get_all(vod, 2)
+    # VideoInfo: field 3 = dash_audio (repeated DashItem)
+    audio_entries = _pb_get_all(vod, 3)
+
+    videos = []
+    for wt, sdata in stream_entries:
+        if wt != 2:
+            continue
+        stream = _pb_parse(sdata)
+        # Stream: field 1 = stream_info (StreamInfo)
+        si_bytes = _pb_get_bytes(stream, 1)
+        # Stream: field 2 = dash_video (DashVideo)
+        dv_bytes = _pb_get_bytes(stream, 2)
+        if not si_bytes or not dv_bytes:
+            continue
+
+        si = _pb_parse(si_bytes)
+        qn = _pb_get_varint(si, 1)       # quality
+        codec_str = _pb_get_string(si, 2) # format
+        desc = _pb_get_string(si, 3)      # description
+        need_vip = _pb_get_varint(si, 6)  # need_vip
+        need_login = _pb_get_varint(si, 7) # need_login
+
+        dv = _pb_parse(dv_bytes)
+        base_url = _pb_get_string(dv, 1)  # base_url
+        # DashVideo: field 2 = backup_url (repeated)
+        backups = [v.decode("utf-8", errors="replace")
+                   for wt2, v in _pb_get_all(dv, 2) if wt2 == 2]
+        bandwidth = _pb_get_varint(dv, 3)
+        codecid = _pb_get_varint(dv, 4)
+        width = _pb_get_varint(dv, 7)
+        height = _pb_get_varint(dv, 8)
+        size = _pb_get_varint(dv, 10)
+
+        if not base_url:
+            continue
+
+        # codecid: 7=AVC(H.264), 12=HEVC(H.265), 13=AV1
+        codec_name = {7: "avc", 12: "hevc", 13: "av1"}.get(codecid, f"c{codecid}")
+
+        videos.append({
+            "qn": qn,
+            "codec": codec_name,
+            "width": width,
+            "height": height,
+            "bandwidth": bandwidth,
+            "url": base_url,
+            "backup": backups,
+            "size": size,
+            "need_vip": bool(need_vip),
+        })
+
+    audios = []
+    for wt, adata in audio_entries:
+        if wt != 2:
+            continue
+        da = _pb_parse(adata)
+        base_url = _pb_get_string(da, 1)
+        backups = [v.decode("utf-8", errors="replace")
+                   for wt2, v in _pb_get_all(da, 2) if wt2 == 2]
+        bandwidth = _pb_get_varint(da, 3)
+        codecid = _pb_get_varint(da, 4)
+        audio_id = _pb_get_varint(da, 7)
+        size = _pb_get_varint(da, 10)
+
+        if not base_url:
+            continue
+        audios.append({
+            "id": audio_id or codecid,
+            "codec": f"audio_{codecid}",
+            "bandwidth": bandwidth,
+            "url": base_url,
+            "backup": backups,
+            "size": size,
+        })
+
+    # field 7 = qn_trial_info (QnTrialInfo)
+    trial_bytes = _pb_get_bytes(reply, 7)
+    trial_info = None
+    if trial_bytes:
+        ti = _pb_parse(trial_bytes)
+        trial_info = {
+            "trial_able": bool(_pb_get_varint(ti, 1)),
+            "remaining_times": _pb_get_varint(ti, 2),
+            "time_length": _pb_get_varint(ti, 4),
+        }
+
+    if not videos:
+        return None
+
+    return {
+        "video": videos,
+        "audio": audios,
+        "trial_info": trial_info,
+        "source": "grpc",
+    }
+
+
+def bili_download_stream(url, output_path, referer=None,
+                         progress_callback=None, cancel_flag=None,
+                         pause_flag=None):
+    """Bilibili 스트림(m4s) 다운로드"""
+    headers = {"User-Agent": _BILI_UA,
+               "Referer": referer or _BILI_REFERER}
+    try:
+        r = requests.get(url, headers=headers, timeout=30, stream=True)
+        r.raise_for_status()
+    except Exception:
+        return False
+    total = int(r.headers.get("Content-Length", 0))
+    downloaded = 0
+    start = time.time()
+    last_t = start
+    last_b = 0
+    with open(output_path, "wb") as f:
+        for chunk in r.iter_content(chunk_size=65536):
+            while pause_flag and pause_flag():
+                if cancel_flag and cancel_flag():
+                    r.close()
+                    return False
+                time.sleep(0.2)
+            if cancel_flag and cancel_flag():
+                r.close()
+                return False
+            try:
+                f.write(chunk)
+            except OSError:
+                r.close()
+                return False
+            downloaded += len(chunk)
+            now = time.time()
+            dt = now - last_t
+            if dt >= 0.5 and progress_callback:
+                speed = (downloaded - last_b) / dt
+                progress_callback(downloaded, total, speed)
+                last_t = now
+                last_b = downloaded
+            # Bilibili 속도 제한
+            if SPEED_LIMIT_BILI > 0:
+                expected = downloaded / SPEED_LIMIT_BILI
+                actual = now - start
+                if expected > actual:
+                    time.sleep(min(expected - actual, 0.5))
+    if progress_callback:
+        progress_callback(downloaded, total, 0)
+    return True
+
+
+def _find_ffmpeg():
+    """ffmpeg 실행 파일 경로 찾기"""
+    import shutil, subprocess
+    # 1) PATH에서 찾기
+    path = shutil.which("ffmpeg")
+    if path:
+        return path
+    # 2) exe와 같은 폴더
+    if getattr(sys, "frozen", False):
+        local = os.path.join(os.path.dirname(sys.executable), "ffmpeg.exe")
+        if os.path.isfile(local):
+            return local
+    # 3) 일반적인 Windows 설치 경로
+    for d in [
+        r"C:\ffmpeg\bin\ffmpeg.exe",
+        r"C:\ffmpeg\ffmpeg.exe",
+        os.path.expandvars(r"%LOCALAPPDATA%\ffmpeg\bin\ffmpeg.exe"),
+        os.path.expandvars(r"%ProgramFiles%\ffmpeg\bin\ffmpeg.exe"),
+        r"C:\ProgramData\chocolatey\bin\ffmpeg.exe",
+    ]:
+        if os.path.isfile(d):
+            return d
+    return None
+
+_ffmpeg_path = None
+
+def bili_mux(video_path, audio_path, output_path):
+    """ffmpeg로 비디오+오디오 합치기"""
+    global _ffmpeg_path
+    if not _ffmpeg_path:
+        _ffmpeg_path = _find_ffmpeg()
+    if not _ffmpeg_path:
+        return False
+    import subprocess
+    cmd = [
+        _ffmpeg_path, "-y", "-i", video_path, "-i", audio_path,
+        "-c", "copy", "-movflags", "+faststart", output_path
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, timeout=300)
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
+def bili_check_ffmpeg():
+    """ffmpeg 사용 가능 여부 확인"""
+    global _ffmpeg_path
+    _ffmpeg_path = _find_ffmpeg()
+    return _ffmpeg_path is not None
 
 
 # ── 공유 링크 처리 ────────────────────────────────────────────────────────────
@@ -889,6 +1442,204 @@ def transfer_shared_file(bduss, share_url, extract_code, log=None):
             return None, tr("err_too_many")
         else:
             return None, tr("err_unknown")
+
+
+# ── Quark Pan API ──────────────────────────────────────────────────────────────
+
+QUARK_API_BASE = "https://drive-pc.quark.cn/1/clouddrive"
+QUARK_COMMON_PARAMS = {"pr": "ucpro", "fr": "pc"}
+_QUARK_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+             "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
+
+
+def quark_session(cookie_str):
+    """Cookie 문자열로 Quark requests.Session 생성"""
+    s = requests.Session()
+    s.headers["User-Agent"] = _QUARK_UA
+    s.headers["Referer"] = "https://pan.quark.cn/"
+    s.headers["Accept"] = "application/json, text/plain, */*"
+    # cookie_str → 개별 쿠키 파싱
+    for part in cookie_str.split(";"):
+        part = part.strip()
+        if "=" in part:
+            k, v = part.split("=", 1)
+            s.cookies.set(k.strip(), v.strip(), domain=".quark.cn")
+    return s
+
+
+def quark_parse_url(url):
+    """Quark 공유 URL에서 pwd_id 추출
+    예: https://pan.quark.cn/s/abcdef123456
+    Returns: pwd_id 문자열 또는 None
+    """
+    m = re.search(r'pan\.quark\.cn/s/([a-zA-Z0-9]+)', url)
+    return m.group(1) if m else None
+
+
+def quark_get_stoken(pwd_id, cookie_str, passcode=""):
+    """공유 링크 stoken 획득
+    Returns: (stoken, error_msg)
+    """
+    s = quark_session(cookie_str)
+    url = f"{QUARK_API_BASE}/share/sharepage/token"
+    params = dict(QUARK_COMMON_PARAMS)
+    body = {"pwd_id": pwd_id, "passcode": passcode}
+    try:
+        r = s.post(url, params=params, json=body, timeout=15)
+        data = r.json()
+    except Exception:
+        return None, tr("err_network")
+    if data.get("status") != 200 and data.get("code") != 0:
+        msg = data.get("message", "")
+        if "passcode" in msg.lower() or data.get("code") == 41013:
+            return None, tr("err_wrong_code")
+        return None, msg or tr("err_expired")
+    stoken = data.get("data", {}).get("stoken", "")
+    if not stoken:
+        return None, tr("err_expired")
+    return stoken, None
+
+
+def quark_list_files(pwd_id, stoken, cookie_str, pdir_fid="0"):
+    """공유 파일 목록 조회
+    Returns: (file_list, error_msg)
+    """
+    s = quark_session(cookie_str)
+    url = f"{QUARK_API_BASE}/share/sharepage/detail"
+    params = dict(QUARK_COMMON_PARAMS)
+    params.update({
+        "pwd_id": pwd_id,
+        "stoken": stoken,
+        "pdir_fid": pdir_fid,
+        "force": 0,
+        "_page": 1,
+        "_size": 200,
+        "_sort": "file_type:asc,updated_at:desc",
+    })
+    try:
+        r = s.get(url, params=params, timeout=15)
+        data = r.json()
+    except Exception:
+        return None, tr("err_network")
+    if data.get("status") != 200 and data.get("code") != 0:
+        return None, data.get("message", tr("err_expired"))
+    file_list = data.get("data", {}).get("list", [])
+    return file_list, None
+
+
+def quark_save_to_drive(pwd_id, stoken, fid_list, fid_token_list, cookie_str, to_pdir_fid="0"):
+    """공유 파일을 내 드라이브에 저장
+    Returns: (task_id, error_msg)
+    """
+    s = quark_session(cookie_str)
+    url = f"{QUARK_API_BASE}/share/sharepage/save"
+    params = dict(QUARK_COMMON_PARAMS)
+    body = {
+        "pwd_id": pwd_id,
+        "stoken": stoken,
+        "fid_list": fid_list,
+        "fid_token_list": fid_token_list,
+        "to_pdir_fid": to_pdir_fid,
+    }
+    try:
+        r = s.post(url, params=params, json=body, timeout=30)
+        data = r.json()
+    except Exception:
+        return None, tr("err_network")
+    if data.get("status") != 200 and data.get("code") != 0:
+        msg = data.get("message", "")
+        if "space" in msg.lower() or data.get("code") == 41017:
+            return None, tr("err_quota")
+        return None, msg or tr("err_unknown")
+    task_id = data.get("data", {}).get("task_id", "")
+    return task_id, None
+
+
+def quark_get_download_url(fid, cookie_str):
+    """다운로드 URL 획득
+    Returns: (download_url, error_msg)
+    """
+    s = quark_session(cookie_str)
+    url = f"{QUARK_API_BASE}/file/download"
+    params = dict(QUARK_COMMON_PARAMS)
+    body = {"fids": [fid]}
+    try:
+        r = s.post(url, params=params, json=body, timeout=15)
+        data = r.json()
+    except Exception:
+        return None, tr("err_network")
+    if data.get("status") != 200 and data.get("code") != 0:
+        return None, data.get("message", tr("err_unknown"))
+    dl_list = data.get("data", [])
+    if not dl_list:
+        return None, tr("err_no_files")
+    dl_url = dl_list[0].get("download_url", "")
+    if not dl_url:
+        return None, tr("err_no_files")
+    return dl_url, None
+
+
+def quark_download_file(download_url, cookie_str, output_path, total_size=0,
+                        progress_callback=None, cancel_flag=None, pause_flag=None):
+    """Quark 파일 다운로드 (Range 지원, 속도 제한)
+    Returns: True/False
+    """
+    s = quark_session(cookie_str)
+    headers = {"User-Agent": _QUARK_UA, "Referer": "https://pan.quark.cn/"}
+    # 이어받기
+    downloaded = 0
+    if os.path.exists(output_path):
+        downloaded = os.path.getsize(output_path)
+        if total_size > 0 and downloaded >= total_size:
+            return True
+    if downloaded > 0:
+        headers["Range"] = f"bytes={downloaded}-"
+    mode = "ab" if downloaded > 0 else "wb"
+    try:
+        r = requests.get(download_url, headers=headers, timeout=60, stream=True,
+                         cookies=s.cookies)
+        if r.status_code not in (200, 206):
+            return False
+    except Exception:
+        return False
+    if total_size == 0:
+        total_size = int(r.headers.get("Content-Length", 0)) + downloaded
+    start_time = time.time()
+    last_t = start_time
+    last_b = downloaded
+    with open(output_path, mode) as f:
+        for chunk in r.iter_content(chunk_size=65536):
+            while pause_flag and pause_flag():
+                if cancel_flag and cancel_flag():
+                    r.close()
+                    return False
+                time.sleep(0.2)
+            if cancel_flag and cancel_flag():
+                r.close()
+                return False
+            try:
+                f.write(chunk)
+            except OSError:
+                r.close()
+                return False
+            downloaded += len(chunk)
+            now = time.time()
+            dt = now - last_t
+            if dt >= 0.5:
+                speed = (downloaded - last_b) / dt
+                if progress_callback:
+                    progress_callback(downloaded, total_size, speed)
+                last_t = now
+                last_b = downloaded
+            # Quark 속도 제한
+            if SPEED_LIMIT_QUARK > 0:
+                expected = downloaded / SPEED_LIMIT_QUARK
+                actual = now - start_time
+                if expected > actual:
+                    time.sleep(min(expected - actual, 0.5))
+    if progress_callback:
+        progress_callback(downloaded, total_size, 0)
+    return True
 
 
 # ── CLI 명령 ──────────────────────────────────────────────────────────────────
@@ -1138,6 +1889,10 @@ _T = {
   "parallel_conn_desc":"Free accounts: exceeding 4 may cause Baidu to throttle.",
   "parallel_conn_warn":"16+: Free accounts may get throttled or blocked.",
   "tray_downloading":"{n} downloading - {pct}%","tray_paused":"{n} paused","tray_idle":"Idle",
+  "bili_download":"Bilibili Download","bili_url":"Enter Bilibili URL","bili_analyze":"Analyze","bili_quality":"Quality","bili_no_ffmpeg":"ffmpeg not found. Install ffmpeg to mux video/audio.","bili_analyzing":"Analyzing...","bili_no_streams":"No streams found.","bili_downloading":"Downloading Bilibili video...","bili_muxing":"Muxing video + audio...","bili_complete":"Bilibili download complete.","bili_failed":"Bilibili download failed.","bili_sessdata_hint":"Optional - paste SESSDATA cookie for 4K (VIP)",
+  "quark_download":"Quark Pan Download","quark_title":"Quark Pan - Share Link","quark_passcode":"Passcode:","quark_cookie":"Cookie:","quark_cookie_hint":"Paste cookies from browser","quark_need_cookie":"Enter Quark cookie first","quark_saving":"Saving to drive...","quark_select_files":"{n} files found",
+  "priority_download":"Download First","settings_general":"General","settings_baidu":"Baidu Pan","settings_bili":"Bilibili","settings_quark":"Quark Pan","bduss_hint":"Paste BDUSS value",
+  "bduss_guide":"How to get BDUSS:\n1. Open pan.baidu.com in browser and log in\n2. Press F12 → Application → Cookies → pan.baidu.com\n3. Find 'BDUSS' and copy its value","sessdata_guide":"How to get SESSDATA:\n1. Open bilibili.com in browser and log in\n2. Press F12 → Application → Cookies → bilibili.com\n3. Find 'SESSDATA' and copy its value","quark_cookie_guide":"How to get Cookie:\n1. Open pan.quark.cn in browser and log in\n2. Press F12 → Network → any request → Headers\n3. Copy the entire 'Cookie' header value",
  },
  "ko": {
   "menu_file":"파일","menu_help":"도움말","refresh":"새로고침","share_link":"공유 링크로 추가","settings":"설정","logout":"로그아웃","logout_confirm":"로그아웃 하시겠습니까?","select":"",
@@ -1216,6 +1971,10 @@ _T = {
   "parallel_conn_desc":"무료 계정은 4개를 넘기면 바이두에서 속도 제한을 걸 수 있습니다.",
   "parallel_conn_warn":"16개 이상: 무료 계정은 속도 제한이나 차단될 수 있습니다.",
   "tray_downloading":"{n}개 다운로드 중 - {pct}%","tray_paused":"{n}개 일시정지","tray_idle":"대기 중",
+  "bili_download":"Bilibili 다운로드","bili_url":"Bilibili URL 입력","bili_analyze":"분석","bili_quality":"화질","bili_no_ffmpeg":"ffmpeg를 찾을 수 없습니다. 영상/음성 병합을 위해 ffmpeg를 설치하세요.","bili_analyzing":"분석 중...","bili_no_streams":"스트림을 찾을 수 없습니다.","bili_downloading":"Bilibili 영상 다운로드 중...","bili_muxing":"영상 + 음성 병합 중...","bili_complete":"Bilibili 다운로드 완료.","bili_failed":"Bilibili 다운로드 실패.","bili_sessdata_hint":"선택사항 - 4K용 SESSDATA 쿠키 붙여넣기 (VIP)",
+  "quark_download":"Quark 다운로드","quark_title":"Quark 공유 링크","quark_passcode":"추출코드:","quark_cookie":"쿠키:","quark_cookie_hint":"브라우저에서 쿠키 붙여넣기","quark_need_cookie":"Quark 쿠키를 먼저 입력하세요","quark_saving":"드라이브에 저장 중...","quark_select_files":"{n}개 파일 발견",
+  "priority_download":"우선 다운로드","settings_general":"일반","settings_baidu":"바이두","settings_bili":"Bilibili","settings_quark":"Quark","bduss_hint":"BDUSS 값 붙여넣기",
+  "bduss_guide":"BDUSS 가져오는 방법:\n1. 브라우저에서 pan.baidu.com 접속 후 로그인\n2. F12 → 애플리케이션 → 쿠키 → pan.baidu.com\n3. 'BDUSS' 항목의 값을 복사","sessdata_guide":"SESSDATA 가져오는 방법:\n1. 브라우저에서 bilibili.com 접속 후 로그인\n2. F12 → 애플리케이션 → 쿠키 → bilibili.com\n3. 'SESSDATA' 항목의 값을 복사","quark_cookie_guide":"Cookie 가져오는 방법:\n1. 브라우저에서 pan.quark.cn 접속 후 로그인\n2. F12 → 네트워크 → 아무 요청 → 헤더\n3. 'Cookie' 헤더 값 전체를 복사",
  },
  "ja": {
   "menu_file":"ファイル","menu_help":"ヘルプ","refresh":"更新","share_link":"共有リンクで追加","settings":"設定","logout":"ログアウト","logout_confirm":"ログアウトしますか？","select":"",
@@ -1294,6 +2053,10 @@ _T = {
   "parallel_conn_desc":"無料アカウントは4つを超えるとBaiduが速度制限をかける場合があります。",
   "parallel_conn_warn":"16以上：無料アカウントは速度制限やブロックされる可能性があります。",
   "tray_downloading":"{n}件ダウンロード中 - {pct}%","tray_paused":"{n}件一時停止中","tray_idle":"待機中",
+  "bili_download":"Bilibiliダウンロード","bili_url":"Bilibili URLを入力","bili_analyze":"分析","bili_quality":"画質","bili_no_ffmpeg":"ffmpegが見つかりません。動画/音声の結合にffmpegをインストールしてください。","bili_analyzing":"分析中...","bili_no_streams":"ストリームが見つかりません。","bili_downloading":"Bilibili動画ダウンロード中...","bili_muxing":"動画＋音声を結合中...","bili_complete":"Bilibiliダウンロード完了。","bili_failed":"Bilibiliダウンロード失敗。","bili_sessdata_hint":"任意 - 4K用SESSDATAクッキーを貼り付け（VIP）",
+  "quark_download":"Quarkダウンロード","quark_title":"Quark共有リンク","quark_passcode":"抽出コード:","quark_cookie":"クッキー:","quark_cookie_hint":"ブラウザからクッキーを貼り付け","quark_need_cookie":"Quarkクッキーを先に入力してください","quark_saving":"ドライブに保存中...","quark_select_files":"{n}件のファイルが見つかりました",
+  "priority_download":"優先ダウンロード","settings_general":"一般","settings_baidu":"Baidu Pan","settings_bili":"Bilibili","settings_quark":"Quark Pan","bduss_hint":"BDUSS値を貼り付け",
+  "bduss_guide":"BDUSSの取得方法:\n1. ブラウザでpan.baidu.comを開いてログイン\n2. F12→Application→Cookies→pan.baidu.com\n3. 'BDUSS'の値をコピー","sessdata_guide":"SESSデータの取得方法:\n1. ブラウザでbilibili.comを開いてログイン\n2. F12→Application→Cookies→bilibili.com\n3. 'SESSDATA'の値をコピー","quark_cookie_guide":"Cookieの取得方法:\n1. ブラウザでpan.quark.cnを開いてログイン\n2. F12→Network→任意のリクエスト→Headers\n3. 'Cookie'ヘッダーの値をコピー",
  },
  "zh": {
   "menu_file":"文件","menu_help":"帮助","refresh":"刷新","share_link":"通过共享链接添加","settings":"设置","logout":"退出登录","logout_confirm":"确定要退出登录吗？","select":"",
@@ -1372,18 +2135,34 @@ _T = {
   "parallel_conn_desc":"免费账户超过4个可能会被百度限速。",
   "parallel_conn_warn":"16个以上：免费账户可能被限速或封禁。",
   "tray_downloading":"{n}个下载中 - {pct}%","tray_paused":"{n}个已暂停","tray_idle":"空闲",
+  "bili_download":"Bilibili下载","bili_url":"输入Bilibili URL","bili_analyze":"分析","bili_quality":"画质","bili_no_ffmpeg":"未找到ffmpeg。请安装ffmpeg以合并视频/音频。","bili_analyzing":"分析中...","bili_no_streams":"未找到可用流。","bili_downloading":"正在下载Bilibili视频...","bili_muxing":"正在合并视频+音频...","bili_complete":"Bilibili下载完成。","bili_failed":"Bilibili下载失败。","bili_sessdata_hint":"可选 - 粘贴SESSDATA Cookie以下载4K（VIP）",
+  "quark_download":"夸克网盘下载","quark_title":"夸克网盘 - 共享链接","quark_passcode":"提取码:","quark_cookie":"Cookie:","quark_cookie_hint":"从浏览器粘贴Cookie","quark_need_cookie":"请先输入夸克Cookie","quark_saving":"正在保存到网盘...","quark_select_files":"发现{n}个文件",
+  "priority_download":"优先下载","settings_general":"常规","settings_baidu":"百度网盘","settings_bili":"Bilibili","settings_quark":"夸克网盘","bduss_hint":"粘贴BDUSS值",
+  "bduss_guide":"BDUSS获取方法:\n1. 在浏览器中打开pan.baidu.com并登录\n2. F12→Application→Cookies→pan.baidu.com\n3. 复制'BDUSS'的值","sessdata_guide":"SESSDATA获取方法:\n1. 在浏览器中打开bilibili.com并登录\n2. F12→Application→Cookies→bilibili.com\n3. 复制'SESSDATA'的值","quark_cookie_guide":"Cookie获取方法:\n1. 在浏览器中打开pan.quark.cn并登录\n2. F12→Network→任意请求→Headers\n3. 复制'Cookie'头的值",
  },
 }
 
 def _init_lang():
-    global _lang, SPEED_LIMIT, MAX_CONCURRENT, PARALLEL_CONN
+    global _lang, SPEED_LIMIT, SPEED_LIMIT_BAIDU, SPEED_LIMIT_BILI, SPEED_LIMIT_QUARK
+    global MAX_CONCURRENT, PARALLEL_CONN
     cfg = load_config()
     _lang = cfg.get("language", "ko")
     if _lang not in _T:
         _lang = "en"
-    SPEED_LIMIT = cfg.get("speed_limit", SPEED_LIMIT)
+    # Legacy speed_limit → SPEED_LIMIT_BAIDU
+    legacy = cfg.get("speed_limit", 0)
     if not cfg.get("speed_limit_enabled", True):
-        SPEED_LIMIT = 0
+        legacy = 0
+    SPEED_LIMIT_BAIDU = cfg.get("speed_limit_baidu", legacy)
+    if not cfg.get("speed_limit_baidu_enabled", cfg.get("speed_limit_enabled", False)):
+        SPEED_LIMIT_BAIDU = 0
+    SPEED_LIMIT_BILI = cfg.get("speed_limit_bili", 0)
+    if not cfg.get("speed_limit_bili_enabled", False):
+        SPEED_LIMIT_BILI = 0
+    SPEED_LIMIT_QUARK = cfg.get("speed_limit_quark", 0)
+    if not cfg.get("speed_limit_quark_enabled", False):
+        SPEED_LIMIT_QUARK = 0
+    SPEED_LIMIT = SPEED_LIMIT_BAIDU  # alias for backward compat
     MAX_CONCURRENT = cfg.get("max_concurrent", MAX_CONCURRENT)
     PARALLEL_CONN = cfg.get("parallel_conn", PARALLEL_CONN)
 
@@ -1512,6 +2291,151 @@ if HAS_GUI:
             except Exception:
                 self.finished.emit((None, tr("err_unknown")))
 
+    class BiliDownloadWorker(QThread):
+        """Bilibili 비디오+오디오 다운로드 후 mux"""
+        progress = Signal(int, int, float)  # downloaded, total, speed
+        finished = Signal(bool)
+
+        def __init__(self, video_url, audio_url, output_path, referer):
+            super().__init__()
+            self.video_url = video_url
+            self.audio_url = audio_url
+            self.output_path = output_path
+            self.referer = referer
+            self._cancelled = False
+            self._paused = False
+
+        def cancel(self):
+            self._cancelled = True
+
+        def pause(self):
+            self._paused = True
+
+        def resume(self):
+            self._paused = False
+
+        def run(self):
+            import tempfile
+            tmp_dir = os.path.dirname(self.output_path)
+            base = os.path.splitext(os.path.basename(self.output_path))[0]
+            vid_path = os.path.join(tmp_dir, f".{base}_v.m4s")
+            aud_path = os.path.join(tmp_dir, f".{base}_a.m4s")
+
+            # 1) 비디오 다운로드
+            ok = bili_download_stream(
+                self.video_url, vid_path, self.referer,
+                progress_callback=lambda d, t, s: self.progress.emit(d, t, s),
+                cancel_flag=lambda: self._cancelled,
+                pause_flag=lambda: self._paused)
+            if not ok or self._cancelled:
+                self._cleanup(vid_path, aud_path)
+                self.finished.emit(False)
+                return
+
+            # 2) 오디오 다운로드
+            ok = bili_download_stream(
+                self.audio_url, aud_path, self.referer,
+                cancel_flag=lambda: self._cancelled,
+                pause_flag=lambda: self._paused)
+            if not ok or self._cancelled:
+                self._cleanup(vid_path, aud_path)
+                self.finished.emit(False)
+                return
+
+            # 3) mux
+            ok = bili_mux(vid_path, aud_path, self.output_path)
+            self._cleanup(vid_path, aud_path)
+            self.finished.emit(ok)
+
+        def _cleanup(self, *paths):
+            for p in paths:
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
+
+    class QuarkShareWorker(QThread):
+        """Quark 공유 링크 분석 (stoken → 파일 목록)"""
+        files_loaded = Signal(list)  # file list
+        error = Signal(str)
+
+        def __init__(self, url, cookie_str, passcode=""):
+            super().__init__()
+            self.url = url
+            self.cookie_str = cookie_str
+            self.passcode = passcode
+
+        def run(self):
+            pwd_id = quark_parse_url(self.url)
+            if not pwd_id:
+                self.error.emit(tr("err_bad_url"))
+                return
+            stoken, err = quark_get_stoken(pwd_id, self.cookie_str, self.passcode)
+            if not stoken:
+                self.error.emit(err)
+                return
+            files, err = quark_list_files(pwd_id, stoken, self.cookie_str)
+            if files is None:
+                self.error.emit(err)
+                return
+            # stoken, pwd_id를 각 파일에 주입
+            for f in files:
+                f["_stoken"] = stoken
+                f["_pwd_id"] = pwd_id
+            self.files_loaded.emit(files)
+
+    class QuarkDownloadWorker(QThread):
+        """Quark 파일 다운로드 (save-to-drive → download URL → 스트리밍)"""
+        progress = Signal(int, int, float)
+        finished = Signal(bool)
+
+        def __init__(self, fid, fid_token, pwd_id, stoken, cookie_str, output_path, total_size, filename):
+            super().__init__()
+            self.fid = fid
+            self.fid_token = fid_token
+            self.pwd_id = pwd_id
+            self.stoken = stoken
+            self.cookie_str = cookie_str
+            self.output_path = output_path
+            self.total_size = total_size
+            self.filename = filename
+            self._cancelled = False
+            self._paused = False
+
+        def cancel(self):
+            self._cancelled = True
+
+        def pause(self):
+            self._paused = True
+
+        def resume(self):
+            self._paused = False
+
+        def run(self):
+            # 1) save to drive
+            task_id, err = quark_save_to_drive(
+                self.pwd_id, self.stoken,
+                [self.fid], [self.fid_token],
+                self.cookie_str)
+            # save 실패해도 이미 저장된 경우 계속 진행
+            if self._cancelled:
+                self.finished.emit(False)
+                return
+
+            # 2) get download URL (직접 fid로)
+            dl_url, err = quark_get_download_url(self.fid, self.cookie_str)
+            if not dl_url:
+                self.finished.emit(False)
+                return
+
+            # 3) download
+            ok = quark_download_file(
+                dl_url, self.cookie_str, self.output_path, self.total_size,
+                progress_callback=lambda d, t, s: self.progress.emit(d, t, s),
+                cancel_flag=lambda: self._cancelled,
+                pause_flag=lambda: self._paused)
+            self.finished.emit(ok)
+
     class UpdateCheckWorker(QThread):
         """GitHub Releases에서 최신 버전 확인"""
         result = Signal(object)  # dict {"version","download_url"} or None
@@ -1580,67 +2504,6 @@ if HAS_GUI:
 
     # ── 다이얼로그 ───────────────────────────────────────────────────────────
 
-    class LoginDialog(QDialog):
-        def __init__(self, parent=None):
-            super().__init__(parent)
-            self.setWindowTitle(tr("login_title"))
-            self.setMinimumWidth(520)
-            self.bduss_value = ""
-            self.login_info = None
-            self.auto_login = False
-            cfg = load_config()
-            layout = QVBoxLayout(self)
-            guide = QLabel(tr("login_guide"))
-            guide.setWordWrap(True)
-            guide.setOpenExternalLinks(True)
-            guide.setObjectName("loginGuide")
-            guide.setStyleSheet(
-                "#loginGuide { border: 1px solid palette(mid); "
-                "border-radius: 6px; padding: 12px; }")
-            layout.addWidget(guide)
-            layout.addSpacing(8)
-            layout.addWidget(QLabel(tr("bduss_label")))
-            self.bduss_input = QTextEdit()
-            self.bduss_input.setMaximumHeight(70)
-            self.bduss_input.setPlaceholderText(tr("bduss_placeholder"))
-            saved = cfg.get("bduss", "")
-            if saved:
-                self.bduss_input.setPlainText(saved)
-            layout.addWidget(self.bduss_input)
-            self.auto_login_cb = QCheckBox(tr("auto_login"))
-            self.auto_login_cb.setChecked(cfg.get("auto_login", False))
-            layout.addWidget(self.auto_login_cb)
-            btn_layout = QHBoxLayout()
-            self.error_label = QLabel("")
-            self.error_label.setStyleSheet("color: #e53935;")
-            btn_layout.addWidget(self.error_label)
-            btn_layout.addStretch()
-            self.ok_btn = QPushButton(tr("btn_login"))
-            self.ok_btn.clicked.connect(self._on_login)
-            cancel_btn = QPushButton(tr("btn_cancel"))
-            cancel_btn.clicked.connect(self.reject)
-            btn_layout.addWidget(self.ok_btn)
-            btn_layout.addWidget(cancel_btn)
-            layout.addLayout(btn_layout)
-
-        def _on_login(self):
-            bduss = self.bduss_input.toPlainText().strip()
-            if not bduss:
-                self.error_label.setText(tr("err_empty"))
-                return
-            self.error_label.setText(tr("err_checking"))
-            self.ok_btn.setEnabled(False)
-            QApplication.processEvents()
-            info = verify_login(bduss)
-            if info:
-                self.bduss_value = bduss
-                self.login_info = info
-                self.auto_login = self.auto_login_cb.isChecked()
-                self.accept()
-            else:
-                self.error_label.setText(tr("err_invalid"))
-                self.ok_btn.setEnabled(True)
-
     class ShareDialog(QDialog):
         def __init__(self, parent=None, initial_url=""):
             super().__init__(parent)
@@ -1693,12 +2556,12 @@ if HAS_GUI:
         def __init__(self, parent=None):
             super().__init__(parent)
             self.setWindowTitle(tr("settings_title"))
-            self.setMinimumWidth(450)
+            self.setMinimumWidth(500)
+            self.setMinimumHeight(380)
             cfg = load_config()
             self._parent_win = parent
-            layout = QFormLayout(self)
 
-            # 공통 콤보박스 / 인풋 스타일 (시스템 팔레트 대응)
+            from PySide6.QtWidgets import QTabWidget, QSpinBox
             _combo_style = (
                 "QComboBox { border: 1px solid palette(mid); border-radius: 3px; padding: 4px 8px; "
                 "min-height: 22px; } "
@@ -1709,17 +2572,22 @@ if HAS_GUI:
                 "QLineEdit { border: 1px solid palette(mid); border-radius: 3px; padding: 4px 8px; }"
                 "QLineEdit:hover { border-color: palette(highlight); }")
 
-            # 언어
-            from PySide6.QtWidgets import QComboBox
+            main_layout = QVBoxLayout(self)
+            tabs = QTabWidget()
+            main_layout.addWidget(tabs)
+
+            # ── 일반 탭 ──
+            general_tab = QWidget()
+            g_lay = QFormLayout(general_tab)
+
             self.lang_combo = QComboBox()
             self.lang_combo.setStyleSheet(_combo_style)
             for code, name in _LANG_NAMES.items():
                 self.lang_combo.addItem(name, code)
             cur_idx = list(_LANG_NAMES.keys()).index(_lang) if _lang in _LANG_NAMES else 0
             self.lang_combo.setCurrentIndex(cur_idx)
-            layout.addRow(tr("language"), self.lang_combo)
+            g_lay.addRow(tr("language"), self.lang_combo)
 
-            # 다운로드 폴더
             self.dl_dir_input = QLineEdit(cfg.get("download_dir", get_download_dir()))
             self.dl_dir_input.setStyleSheet(_input_style)
             browse_layout = QHBoxLayout()
@@ -1727,102 +2595,151 @@ if HAS_GUI:
             browse_btn = QPushButton(tr("browse"))
             browse_btn.clicked.connect(self._browse)
             browse_layout.addWidget(browse_btn)
-            layout.addRow(tr("dl_folder"), browse_layout)
+            g_lay.addRow(tr("dl_folder"), browse_layout)
 
-            # 속도 제한 (체크박스 + 숫자입력 + 단위)
-            from PySide6.QtWidgets import QCheckBox, QSpinBox
-            speed_layout = QVBoxLayout()
-            speed_row = QHBoxLayout()
-            self.speed_check = QCheckBox(tr("speed_limit_enable"))
-            self.speed_check.setToolTip(tr("speed_desc"))
-            speed_enabled = cfg.get("speed_limit_enabled", False)
-            self.speed_check.setChecked(speed_enabled)
-            speed_row.addWidget(self.speed_check)
-            self.speed_spin = QSpinBox()
-            self.speed_spin.setRange(1, 1000)
-            self.speed_spin.setToolTip(tr("speed_desc"))
-            self.speed_spin.setStyleSheet(_input_style.replace("QLineEdit", "QSpinBox"))
-            cur_speed = cfg.get("speed_limit", 1 * 1024 * 1024)
-            self.speed_unit = QComboBox()
-            self.speed_unit.setStyleSheet(_combo_style)
-            self.speed_unit.addItem("KB/s", 1024)
-            self.speed_unit.addItem("MB/s", 1024 * 1024)
-            # 현재값 → 숫자+단위 역산
-            if cur_speed >= 1024 * 1024 and cur_speed % (1024 * 1024) == 0:
-                self.speed_spin.setValue(cur_speed // (1024 * 1024))
-                self.speed_unit.setCurrentIndex(1)
-            else:
-                self.speed_spin.setValue(max(1, cur_speed // 1024))
-                self.speed_unit.setCurrentIndex(0)
-            self.speed_spin.setEnabled(speed_enabled)
-            self.speed_unit.setEnabled(speed_enabled)
-            self.speed_check.toggled.connect(self.speed_spin.setEnabled)
-            self.speed_check.toggled.connect(self.speed_unit.setEnabled)
-            speed_row.addWidget(self.speed_spin)
-            speed_row.addWidget(self.speed_unit)
-            speed_layout.addLayout(speed_row)
-            speed_desc = QLabel(tr("speed_desc"))
-            speed_desc.setStyleSheet("font-size: 11px;")
-            speed_desc.setWordWrap(True)
-            speed_layout.addWidget(speed_desc)
-            layout.addRow(tr("speed_limit"), speed_layout)
-
-            # 파일당 연결 수
-            pconn_layout = QVBoxLayout()
-            pconn_row = QHBoxLayout()
-            self.pconn_spin = QSpinBox()
-            self.pconn_spin.setRange(1, 128)
-            self.pconn_spin.setToolTip(tr("parallel_conn_desc"))
-            self.pconn_spin.setStyleSheet(_input_style.replace("QLineEdit", "QSpinBox"))
-            cur_pconn = cfg.get("parallel_conn", PARALLEL_CONN)
-            self.pconn_spin.setValue(cur_pconn)
-            pconn_default = QLabel("(default: 8)")
-            pconn_default.setStyleSheet("font-size: 11px; color: palette(mid);")
-            pconn_row.addWidget(self.pconn_spin)
-            pconn_row.addWidget(pconn_default)
-            pconn_row.addStretch()
-            pconn_layout.addLayout(pconn_row)
-            pconn_desc = QLabel(tr("parallel_conn_desc"))
-            pconn_desc.setStyleSheet("font-size: 11px;")
-            pconn_desc.setWordWrap(True)
-            self.pconn_warn = QLabel(tr("parallel_conn_warn"))
-            self.pconn_warn.setStyleSheet("color: #c0392b; font-size: 11px;")
-            self.pconn_warn.setWordWrap(True)
-            self.pconn_warn.setVisible(cur_pconn >= 16)
-            self.pconn_spin.valueChanged.connect(
-                lambda v: (self.pconn_warn.setVisible(v >= 16), self.adjustSize()))
-            pconn_layout.addWidget(pconn_desc)
-            pconn_layout.addWidget(self.pconn_warn)
-            layout.addRow(tr("parallel_conn"), pconn_layout)
-
-            # 동시 다운로드 파일 수
-            conc_layout = QVBoxLayout()
-            conc_row = QHBoxLayout()
             self.conc_spin = QSpinBox()
             self.conc_spin.setRange(1, 20)
-            self.conc_spin.setToolTip(tr("concurrent_desc"))
             self.conc_spin.setStyleSheet(_input_style.replace("QLineEdit", "QSpinBox"))
-            cur_conc = cfg.get("max_concurrent", MAX_CONCURRENT)
-            self.conc_spin.setValue(cur_conc)
-            conc_default = QLabel("(default: 2)")
-            conc_default.setStyleSheet("font-size: 11px; color: palette(mid);")
+            self.conc_spin.setValue(cfg.get("max_concurrent", MAX_CONCURRENT))
+            conc_row = QHBoxLayout()
             conc_row.addWidget(self.conc_spin)
-            conc_row.addWidget(conc_default)
+            conc_row.addWidget(QLabel("(default: 2)"))
             conc_row.addStretch()
-            conc_layout.addLayout(conc_row)
-            conc_desc = QLabel(tr("concurrent_desc"))
-            conc_desc.setStyleSheet("font-size: 11px;")
-            conc_desc.setWordWrap(True)
-            self.conc_warn = QLabel(tr("concurrent_warn"))
-            self.conc_warn.setStyleSheet("color: #c0392b; font-size: 11px;")
-            self.conc_warn.setWordWrap(True)
-            self.conc_warn.setVisible(cur_conc >= 4)
-            self.conc_spin.valueChanged.connect(
-                lambda v: (self.conc_warn.setVisible(v >= 4), self.adjustSize()))
-            conc_layout.addWidget(conc_desc)
-            conc_layout.addWidget(self.conc_warn)
-            layout.addRow(tr("concurrent_files"), conc_layout)
+            g_lay.addRow(tr("concurrent_files"), conc_row)
 
+            self.pconn_spin = QSpinBox()
+            self.pconn_spin.setRange(1, 128)
+            self.pconn_spin.setStyleSheet(_input_style.replace("QLineEdit", "QSpinBox"))
+            self.pconn_spin.setValue(cfg.get("parallel_conn", PARALLEL_CONN))
+            pconn_row = QHBoxLayout()
+            pconn_row.addWidget(self.pconn_spin)
+            pconn_row.addWidget(QLabel("(default: 8)"))
+            pconn_row.addStretch()
+            g_lay.addRow(tr("parallel_conn"), pconn_row)
+
+            tabs.addTab(general_tab, tr("settings_general"))
+
+            # ── Helper: 속도 제한 위젯 생성 ──
+            def _make_speed_row(cfg_key_enabled, cfg_key_value, default_enabled=False, default_val=1024*1024):
+                row = QHBoxLayout()
+                chk = QCheckBox(tr("speed_limit_enable"))
+                enabled = cfg.get(cfg_key_enabled, default_enabled)
+                chk.setChecked(enabled)
+                row.addWidget(chk)
+                spin = QSpinBox()
+                spin.setRange(1, 1000)
+                spin.setStyleSheet(_input_style.replace("QLineEdit", "QSpinBox"))
+                unit = QComboBox()
+                unit.setStyleSheet(_combo_style)
+                unit.addItem("KB/s", 1024)
+                unit.addItem("MB/s", 1024 * 1024)
+                cur = cfg.get(cfg_key_value, default_val)
+                if cur >= 1024 * 1024 and cur % (1024 * 1024) == 0:
+                    spin.setValue(cur // (1024 * 1024))
+                    unit.setCurrentIndex(1)
+                else:
+                    spin.setValue(max(1, cur // 1024))
+                    unit.setCurrentIndex(0)
+                spin.setEnabled(enabled)
+                unit.setEnabled(enabled)
+                chk.toggled.connect(spin.setEnabled)
+                chk.toggled.connect(unit.setEnabled)
+                row.addWidget(spin)
+                row.addWidget(unit)
+                return row, chk, spin, unit
+
+            # ── Baidu Pan 탭 ──
+            baidu_tab = QWidget()
+            b_lay = QFormLayout(baidu_tab)
+
+            bduss_guide = QLabel(tr("bduss_guide"))
+            bduss_guide.setStyleSheet("font-size: 11px; color: #666; padding: 4px 0;")
+            bduss_guide.setWordWrap(True)
+            b_lay.addRow("", bduss_guide)
+
+            self.bduss_input = QLineEdit()
+            self.bduss_input.setStyleSheet(_input_style)
+            self.bduss_input.setPlaceholderText(tr("bduss_hint"))
+            self.bduss_input.setEchoMode(QLineEdit.EchoMode.Password)
+            saved_bduss = cfg.get("bduss", "")
+            if saved_bduss:
+                self.bduss_input.setText(saved_bduss)
+            bduss_row = QHBoxLayout()
+            bduss_row.addWidget(self.bduss_input)
+            self.bduss_verify_btn = QPushButton(tr("btn_login"))
+            self.bduss_verify_btn.clicked.connect(self._verify_bduss)
+            bduss_row.addWidget(self.bduss_verify_btn)
+            b_lay.addRow("BDUSS:", bduss_row)
+
+            self.bduss_status = QLabel("")
+            self.bduss_status.setStyleSheet("font-size: 11px;")
+            b_lay.addRow("", self.bduss_status)
+
+            self.auto_login_cb = QCheckBox(tr("auto_login"))
+            self.auto_login_cb.setChecked(cfg.get("auto_login", False))
+            b_lay.addRow("", self.auto_login_cb)
+
+            speed_row_b, self.speed_check_baidu, self.speed_spin_baidu, self.speed_unit_baidu = \
+                _make_speed_row("speed_limit_baidu_enabled", "speed_limit_baidu",
+                                cfg.get("speed_limit_enabled", False),
+                                cfg.get("speed_limit", 1024*1024))
+            b_lay.addRow(tr("speed_limit"), speed_row_b)
+            b_desc = QLabel(tr("speed_desc"))
+            b_desc.setStyleSheet("font-size: 11px;")
+            b_desc.setWordWrap(True)
+            b_lay.addRow("", b_desc)
+
+            tabs.addTab(baidu_tab, tr("settings_baidu"))
+
+            # ── Bilibili 탭 ──
+            bili_tab = QWidget()
+            bi_lay = QFormLayout(bili_tab)
+
+            sessdata_guide = QLabel(tr("sessdata_guide"))
+            sessdata_guide.setStyleSheet("font-size: 11px; color: #666; padding: 4px 0;")
+            sessdata_guide.setWordWrap(True)
+            bi_lay.addRow("", sessdata_guide)
+
+            self.sessdata_input = QLineEdit()
+            self.sessdata_input.setStyleSheet(_input_style)
+            self.sessdata_input.setPlaceholderText(tr("bili_sessdata_hint"))
+            self.sessdata_input.setEchoMode(QLineEdit.EchoMode.Password)
+            saved_sess = cfg.get("bili_sessdata", "")
+            if saved_sess:
+                self.sessdata_input.setText(saved_sess)
+            bi_lay.addRow("SESSDATA:", self.sessdata_input)
+
+            speed_row_bi, self.speed_check_bili, self.speed_spin_bili, self.speed_unit_bili = \
+                _make_speed_row("speed_limit_bili_enabled", "speed_limit_bili")
+            bi_lay.addRow(tr("speed_limit"), speed_row_bi)
+
+            tabs.addTab(bili_tab, tr("settings_bili"))
+
+            # ── Quark Pan 탭 ──
+            quark_tab = QWidget()
+            q_lay = QFormLayout(quark_tab)
+
+            quark_guide = QLabel(tr("quark_cookie_guide"))
+            quark_guide.setStyleSheet("font-size: 11px; color: #666; padding: 4px 0;")
+            quark_guide.setWordWrap(True)
+            q_lay.addRow("", quark_guide)
+
+            self.quark_cookie_input = QLineEdit()
+            self.quark_cookie_input.setStyleSheet(_input_style)
+            self.quark_cookie_input.setPlaceholderText(tr("quark_cookie_hint"))
+            self.quark_cookie_input.setEchoMode(QLineEdit.EchoMode.Password)
+            saved_qc = cfg.get("quark_cookie", "")
+            if saved_qc:
+                self.quark_cookie_input.setText(saved_qc)
+            q_lay.addRow(tr("quark_cookie"), self.quark_cookie_input)
+
+            speed_row_q, self.speed_check_quark, self.speed_spin_quark, self.speed_unit_quark = \
+                _make_speed_row("speed_limit_quark_enabled", "speed_limit_quark")
+            q_lay.addRow(tr("speed_limit"), speed_row_q)
+
+            tabs.addTab(quark_tab, tr("settings_quark"))
+
+            # ── 버튼 ──
             btn_layout = QHBoxLayout()
             ok_btn = QPushButton(tr("btn_save"))
             ok_btn.clicked.connect(self._on_save)
@@ -1831,39 +2748,237 @@ if HAS_GUI:
             btn_layout.addStretch()
             btn_layout.addWidget(ok_btn)
             btn_layout.addWidget(cancel_btn)
-            layout.addRow(btn_layout)
+            main_layout.addLayout(btn_layout)
 
         def _browse(self):
             d = QFileDialog.getExistingDirectory(self, tr("select_folder"), self.dl_dir_input.text())
             if d:
                 self.dl_dir_input.setText(d)
 
+        def _verify_bduss(self):
+            bduss = self.bduss_input.text().strip()
+            if not bduss:
+                self.bduss_status.setText(tr("err_empty"))
+                self.bduss_status.setStyleSheet("font-size: 11px; color: #e53935;")
+                return
+            self.bduss_status.setText(tr("err_checking"))
+            self.bduss_status.setStyleSheet("font-size: 11px;")
+            self.bduss_verify_btn.setEnabled(False)
+            QApplication.processEvents()
+            info = verify_login(bduss)
+            self.bduss_verify_btn.setEnabled(True)
+            if info:
+                vip_names = ["Free", "VIP", "SVIP"]
+                vip_str = vip_names[info["vip"]] if info["vip"] < 3 else f"VIP{info['vip']}"
+                self.bduss_status.setText(f"✓ {info['name']} ({vip_str})")
+                self.bduss_status.setStyleSheet("font-size: 11px; color: #2e7d32;")
+            else:
+                self.bduss_status.setText(tr("err_invalid"))
+                self.bduss_status.setStyleSheet("font-size: 11px; color: #e53935;")
+
+        def _get_speed_val(self, spin, unit):
+            return spin.value() * (unit.currentData() or 1024)
+
         def _on_save(self):
-            global _lang, SPEED_LIMIT, MAX_CONCURRENT, PARALLEL_CONN
+            global _lang, SPEED_LIMIT, SPEED_LIMIT_BAIDU, SPEED_LIMIT_BILI, SPEED_LIMIT_QUARK
+            global MAX_CONCURRENT, PARALLEL_CONN
             cfg = load_config()
+            # 일반 탭
             cfg["download_dir"] = self.dl_dir_input.text()
             new_lang = self.lang_combo.currentData()
             lang_changed = (new_lang != _lang)
             cfg["language"] = new_lang
             _lang = new_lang
-            # 속도 제한
-            speed_enabled = self.speed_check.isChecked()
-            cfg["speed_limit_enabled"] = speed_enabled
-            unit_multiplier = self.speed_unit.currentData() or 1024
-            speed_val = self.speed_spin.value() * unit_multiplier
-            cfg["speed_limit"] = speed_val
-            SPEED_LIMIT = speed_val if speed_enabled else 0
-            # 파일당 연결 수
-            pconn_val = self.pconn_spin.value()
-            cfg["parallel_conn"] = pconn_val
-            PARALLEL_CONN = pconn_val
-            # 동시 다운로드 수
             conc_val = self.conc_spin.value()
             cfg["max_concurrent"] = conc_val
             MAX_CONCURRENT = conc_val
+            pconn_val = self.pconn_spin.value()
+            cfg["parallel_conn"] = pconn_val
+            PARALLEL_CONN = pconn_val
+
+            # Baidu 탭
+            bduss = self.bduss_input.text().strip()
+            if bduss:
+                cfg["bduss"] = bduss
+            cfg["auto_login"] = self.auto_login_cb.isChecked()
+            baidu_enabled = self.speed_check_baidu.isChecked()
+            cfg["speed_limit_baidu_enabled"] = baidu_enabled
+            cfg["speed_limit_enabled"] = baidu_enabled  # legacy compat
+            baidu_speed = self._get_speed_val(self.speed_spin_baidu, self.speed_unit_baidu)
+            cfg["speed_limit_baidu"] = baidu_speed
+            cfg["speed_limit"] = baidu_speed  # legacy compat
+            SPEED_LIMIT_BAIDU = baidu_speed if baidu_enabled else 0
+            SPEED_LIMIT = SPEED_LIMIT_BAIDU
+
+            # Bilibili 탭
+            sessdata = self.sessdata_input.text().strip()
+            cfg["bili_sessdata"] = sessdata
+            bili_enabled = self.speed_check_bili.isChecked()
+            cfg["speed_limit_bili_enabled"] = bili_enabled
+            bili_speed = self._get_speed_val(self.speed_spin_bili, self.speed_unit_bili)
+            cfg["speed_limit_bili"] = bili_speed
+            SPEED_LIMIT_BILI = bili_speed if bili_enabled else 0
+
+            # Quark 탭
+            qcookie = self.quark_cookie_input.text().strip()
+            cfg["quark_cookie"] = qcookie
+            quark_enabled = self.speed_check_quark.isChecked()
+            cfg["speed_limit_quark_enabled"] = quark_enabled
+            quark_speed = self._get_speed_val(self.speed_spin_quark, self.speed_unit_quark)
+            cfg["speed_limit_quark"] = quark_speed
+            SPEED_LIMIT_QUARK = quark_speed if quark_enabled else 0
+
             save_config(cfg)
+            # Baidu 로그인 상태 갱신
+            if bduss and self._parent_win:
+                if not self._parent_win.bduss and bduss:
+                    self._parent_win._try_auto_login()
             if lang_changed and self._parent_win:
                 self._parent_win._retranslate()
+            self.accept()
+
+    # ── Quark 다이얼로그 ────────────────────────────────────────────────────
+
+    class QuarkDialog(QDialog):
+        """Quark Pan 공유 링크 다운로드 다이얼로그"""
+        files_selected = Signal(list, str)  # [(file_info, ...), cookie_str]
+
+        def __init__(self, parent=None, initial_url=""):
+            super().__init__(parent)
+            self.setWindowTitle(tr("quark_title"))
+            self.setMinimumWidth(550)
+            self._parent_win = parent
+            self._files = []
+            cfg = load_config()
+
+            layout = QVBoxLayout(self)
+
+            # URL 입력
+            url_row = QHBoxLayout()
+            url_row.addWidget(QLabel("URL:"))
+            self.url_input = QLineEdit()
+            self.url_input.setPlaceholderText("https://pan.quark.cn/s/...")
+            if initial_url:
+                self.url_input.setText(initial_url.split('\n')[0].strip())
+            url_row.addWidget(self.url_input)
+            layout.addLayout(url_row)
+
+            # 추출코드
+            code_row = QHBoxLayout()
+            code_row.addWidget(QLabel(tr("quark_passcode")))
+            self.code_input = QLineEdit()
+            self.code_input.setPlaceholderText(tr("share_code_ph"))
+            self.code_input.setMaxLength(8)
+            code_row.addWidget(self.code_input)
+            layout.addLayout(code_row)
+
+            # Cookie 입력
+            cookie_row = QHBoxLayout()
+            cookie_row.addWidget(QLabel(tr("quark_cookie")))
+            self.cookie_input = QLineEdit()
+            self.cookie_input.setPlaceholderText(tr("quark_cookie_hint"))
+            self.cookie_input.setEchoMode(QLineEdit.EchoMode.Password)
+            saved_cookie = cfg.get("quark_cookie", "")
+            if saved_cookie:
+                self.cookie_input.setText(saved_cookie)
+            cookie_row.addWidget(self.cookie_input)
+            layout.addLayout(cookie_row)
+
+            # 분석 버튼
+            self.analyze_btn = QPushButton(tr("bili_analyze"))
+            self.analyze_btn.clicked.connect(self._analyze)
+            layout.addWidget(self.analyze_btn)
+
+            # 상태 레이블
+            self.status_label = QLabel("")
+            self.status_label.setWordWrap(True)
+            layout.addWidget(self.status_label)
+
+            # 파일 목록 트리
+            self.file_tree = QTreeWidget()
+            self.file_tree.setHeaderLabels([tr("name"), tr("size")])
+            self.file_tree.setRootIsDecorated(False)
+            self.file_tree.setSelectionMode(QTreeWidget.SelectionMode.ExtendedSelection)
+            h = self.file_tree.header()
+            h.setStretchLastSection(True)
+            h.resizeSection(1, 100)
+            layout.addWidget(self.file_tree)
+
+            # 버튼 행
+            btn_row = QHBoxLayout()
+            btn_row.addStretch()
+            self.dl_btn = QPushButton(tr("download"))
+            self.dl_btn.setEnabled(False)
+            self.dl_btn.clicked.connect(self._on_download)
+            btn_row.addWidget(self.dl_btn)
+            cancel_btn = QPushButton(tr("cancel"))
+            cancel_btn.clicked.connect(self.reject)
+            btn_row.addWidget(cancel_btn)
+            layout.addLayout(btn_row)
+
+            if initial_url and saved_cookie:
+                # 자동 분석
+                from PySide6.QtCore import QTimer
+                QTimer.singleShot(200, self._analyze)
+
+        def _analyze(self):
+            url = self.url_input.text().strip()
+            cookie = self.cookie_input.text().strip()
+            if not cookie:
+                self.status_label.setText(tr("quark_need_cookie"))
+                return
+            if not url:
+                return
+            # Cookie 저장
+            cfg = load_config()
+            cfg["quark_cookie"] = cookie
+            save_config(cfg)
+
+            self.analyze_btn.setEnabled(False)
+            self.status_label.setText(tr("bili_analyzing"))
+            self.file_tree.clear()
+
+            passcode = self.code_input.text().strip()
+            self._worker = QuarkShareWorker(url, cookie, passcode)
+            self._worker.files_loaded.connect(self._on_files_loaded)
+            self._worker.error.connect(self._on_error)
+            self._worker.start()
+
+        def _on_files_loaded(self, files):
+            self.analyze_btn.setEnabled(True)
+            self._files = files
+            self.file_tree.clear()
+            for f in files:
+                fname = f.get("file_name", f.get("filename", "?"))
+                fsize = f.get("size", 0)
+                is_dir = f.get("file_type", 0) == 0 or f.get("dir", False)
+                tw = QTreeWidgetItem()
+                icon = "📁" if is_dir else "📄"
+                tw.setText(0, f"{icon} {fname}")
+                tw.setText(1, format_size(fsize) if not is_dir else "-")
+                tw.setData(0, Qt.ItemDataRole.UserRole, f)
+                self.file_tree.addTopLevelItem(tw)
+            self.status_label.setText(tr("quark_select_files", n=len(files)))
+            if files:
+                self.dl_btn.setEnabled(True)
+                # 전체 선택
+                self.file_tree.selectAll()
+
+        def _on_error(self, msg):
+            self.analyze_btn.setEnabled(True)
+            self.status_label.setText(f"Error: {msg}")
+
+        def _on_download(self):
+            selected = self.file_tree.selectedItems()
+            if not selected:
+                return
+            files = []
+            for item in selected:
+                f = item.data(0, Qt.ItemDataRole.UserRole)
+                if f:
+                    files.append(f)
+            cookie = self.cookie_input.text().strip()
+            self.files_selected.emit(files, cookie)
             self.accept()
 
     # ── 체크박스 중앙정렬 Delegate ──────────────────────────────────────────
@@ -2041,6 +3156,8 @@ if HAS_GUI:
             """다운로드 큐 상태를 파일에 저장"""
             data = []
             for e in self._dl_queue:
+                if e.get("type") in ("bilibili", "quark"):
+                    continue  # Bilibili/Quark entries not resumable
                 status = e["status"]
                 # Downloading/Paused → Paused로 저장 (재시작 시 이어받기 가능)
                 if status in ("Downloading", "Paused"):
@@ -2076,11 +3193,12 @@ if HAS_GUI:
                 tw = QTreeWidgetItem()
                 tw.setCheckState(0, Qt.CheckState.Unchecked)
                 tw.setTextAlignment(0, Qt.AlignmentFlag.AlignCenter)
-                tw.setText(1, fname)
-                tw.setText(2, format_size(total_size))
-                tw.setText(3, "")
+                tw.setTextAlignment(1, Qt.AlignmentFlag.AlignCenter)
+                tw.setText(2, fname)
+                tw.setText(3, format_size(total_size))
                 tw.setText(4, "")
                 tw.setText(5, "")
+                tw.setText(6, "")
 
                 # 상태별 표시
                 status_key = {
@@ -2088,7 +3206,7 @@ if HAS_GUI:
                     "Complete": "complete", "Failed": "failed",
                     "Cancelled": "cancelled",
                 }.get(status, "queued")
-                tw.setText(6, tr(status_key))
+                tw.setText(7, tr(status_key))
                 self.dl_tree.addTopLevelItem(tw)
 
                 pb = QProgressBar()
@@ -2113,7 +3231,7 @@ if HAS_GUI:
                         pb.setValue(int(pct * 1000))
                     else:
                         pb.setValue(0)
-                self.dl_tree.setItemWidget(tw, 3, pb)
+                self.dl_tree.setItemWidget(tw, 4, pb)
 
                 entry = {
                     "remote_path": item.get("remote_path", ""),
@@ -2173,6 +3291,10 @@ if HAS_GUI:
             self.act_refresh.triggered.connect(self._refresh)
             self.act_share = file_menu.addAction(tr("share_link"))
             self.act_share.triggered.connect(self._open_share_dialog)
+            self.act_bili = file_menu.addAction(tr("bili_download"))
+            self.act_bili.triggered.connect(lambda: self._open_bili_dialog())
+            self.act_quark = file_menu.addAction(tr("quark_download"))
+            self.act_quark.triggered.connect(lambda: self._open_quark_dialog())
             file_menu.addSeparator()
             self.act_settings = file_menu.addAction(tr("settings"))
             self.act_settings.triggered.connect(self._open_settings)
@@ -2197,13 +3319,13 @@ if HAS_GUI:
             self.path_label = QLabel("Baiduyun: /")
             self.path_label.setObjectName("pathLabel")
             top_bar.addWidget(self.path_label)
+            top_bar.addStretch()
             self.quota_label = QLabel("")
             self.quota_label.setStyleSheet(
-                "font-size: 11px; color: #888; margin-left: 8px; "
+                "font-size: 11px; color: #888; margin-right: 8px; "
                 "padding: 1px 6px; border: 1px solid #ccc; border-radius: 3px;")
             self.quota_label.setVisible(False)
             top_bar.addWidget(self.quota_label)
-            top_bar.addStretch()
             self.user_label = QLabel(tr("not_logged_in"))
             self.user_label.setStyleSheet("font-size: 12px;")
             top_bar.addWidget(self.user_label)
@@ -2300,7 +3422,7 @@ if HAS_GUI:
             dl_h = CheckBoxHeader(Qt.Orientation.Horizontal, self.dl_tree)
             self.dl_tree.setHeader(dl_h)
             self.dl_tree.setHeaderLabels([
-                "", tr("name"), tr("size"), tr("progress"),
+                "", "#", tr("name"), tr("size"), tr("progress"),
                 tr("speed"), tr("eta"), tr("status")])
             self.dl_tree.setRootIsDecorated(False)
             self.dl_tree.setAlternatingRowColors(True)
@@ -2308,11 +3430,12 @@ if HAS_GUI:
             dl_h.setStretchLastSection(True)
             dl_h.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
             dl_h.resizeSection(0, 30)
-            dl_h.resizeSection(2, 130)
-            dl_h.resizeSection(3, 140)
-            dl_h.resizeSection(4, 80)
-            dl_h.resizeSection(5, 70)
-            dl_h.resizeSection(6, 80)
+            dl_h.resizeSection(1, 30)
+            dl_h.resizeSection(3, 130)
+            dl_h.resizeSection(4, 140)
+            dl_h.resizeSection(5, 80)
+            dl_h.resizeSection(6, 70)
+            dl_h.resizeSection(7, 80)
             # 헤더 체크박스 클릭 → 전체선택/해제 토글
             self._select_all_state = False
             dl_h.select_all_clicked.connect(self._on_dl_header_toggled)
@@ -2390,6 +3513,25 @@ if HAS_GUI:
             self._refresh_quota()
             # 시작 시 자동 업데이트 체크 (조용히)
             self._check_update(silent=True)
+
+        def _try_auto_login(self):
+            """config에서 BDUSS 읽어 비동기 로그인 시도"""
+            cfg = load_config()
+            bduss = cfg.get("bduss")
+            if not bduss:
+                self.user_label.setText(tr("not_logged_in"))
+                self.status.showMessage(tr("ready"))
+                return
+            self.status.showMessage(tr("err_checking"))
+            self._auto_login_worker = VerifyLoginWorker(bduss)
+            def _on_verified(info):
+                if info:
+                    self.set_login(bduss, info)
+                else:
+                    self.user_label.setText(tr("not_logged_in"))
+                    self.status.showMessage(tr("err_invalid"))
+            self._auto_login_worker.finished.connect(_on_verified)
+            self._auto_login_worker.start()
 
         def _refresh_quota(self):
             """클라우드 용량 비동기 조회"""
@@ -2507,12 +3649,12 @@ if HAS_GUI:
                 tw = QTreeWidgetItem()
                 tw.setCheckState(0, Qt.CheckState.Unchecked)
                 tw.setTextAlignment(0, Qt.AlignmentFlag.AlignCenter)
-                tw.setText(1, fname)
-                tw.setText(2, format_size(total_size))
-                tw.setText(3, "")
+                tw.setText(2, fname)
+                tw.setText(3, format_size(total_size))
                 tw.setText(4, "")
                 tw.setText(5, "")
-                tw.setText(6, tr("queued"))
+                tw.setText(6, "")
+                tw.setText(7, tr("queued"))
                 self.dl_tree.addTopLevelItem(tw)
 
                 # 프로그레스바 위젯
@@ -2521,7 +3663,7 @@ if HAS_GUI:
                 pb.setValue(0)
                 pb.setFormat("%p%")
                 pb.setFixedHeight(18)
-                self.dl_tree.setItemWidget(tw, 3, pb)
+                self.dl_tree.setItemWidget(tw, 4, pb)
 
                 entry = {
                     "remote_path": remote_path,
@@ -2566,10 +3708,10 @@ if HAS_GUI:
             from PySide6.QtCore import QTimer
             highlight = QColor("#8a6d3b") if _is_windows_dark_mode() else QColor("#fff3cd")
             cols = tw.columnCount()
-            old_status = tw.text(6)
+            old_status = tw.text(7)
             for c in range(cols):
                 tw.setBackground(c, QBrush(highlight))
-            tw.setText(6, tr("already_in_queue"))
+            tw.setText(7, tr("already_in_queue"))
             # 스크롤하여 보이게
             self.dl_tree.scrollToItem(tw)
             def _fade1():
@@ -2579,7 +3721,7 @@ if HAS_GUI:
             def _fade2():
                 for c in range(cols):
                     tw.setData(c, Qt.ItemDataRole.BackgroundRole, None)
-                tw.setText(6, old_status)
+                tw.setText(7, old_status)
             QTimer.singleShot(500, _fade1)
             QTimer.singleShot(1200, _fade2)
 
@@ -2591,12 +3733,15 @@ if HAS_GUI:
                 if active_count >= max_c:
                     break
                 if entry["status"] == "Queued":
-                    self._start_entry(entry)
+                    if entry.get("type") == "quark":
+                        self._start_quark_entry(entry)
+                    else:
+                        self._start_entry(entry)
                     active_count += 1
 
         def _start_entry(self, entry):
             entry["status"] = "Downloading"
-            entry["tw"].setText(6, tr("downloading"))
+            entry["tw"].setText(7, tr("downloading"))
             self._dl_active.append(entry)
 
             worker = DownloadWorker(
@@ -2616,10 +3761,10 @@ if HAS_GUI:
             entry["_speed"] = speed
 
             # 사이즈 컬럼에 진행량 표시
-            entry["tw"].setText(2, f"{format_size(downloaded)} / {format_size(total)}")
+            entry["tw"].setText(3, f"{format_size(downloaded)} / {format_size(total)}")
 
             speed_str = f"{format_size(int(speed))}/s" if speed > 0 else ""
-            entry["tw"].setText(4, speed_str)
+            entry["tw"].setText(5, speed_str)
 
             if speed > 0:
                 secs = (total - downloaded) / speed
@@ -2638,9 +3783,9 @@ if HAS_GUI:
                     d, rem = divmod(int(secs), 86400)
                     h = rem // 3600
                     eta = f"{d}d {h:02d}h"
-                entry["tw"].setText(5, eta)
+                entry["tw"].setText(6, eta)
             else:
-                entry["tw"].setText(5, "∞")
+                entry["tw"].setText(6, "∞")
 
             # 상태바: 활성 다운로드 수 + 현재 파일 정보
             active = len(self._dl_active)
@@ -2658,24 +3803,24 @@ if HAS_GUI:
 
             if ok:
                 entry["status"] = "Complete"
-                entry["tw"].setText(2, format_size(entry["total_size"]))
-                entry["tw"].setText(6, tr("complete"))
-                entry["tw"].setText(4, "")
+                entry["tw"].setText(3, format_size(entry["total_size"]))
+                entry["tw"].setText(7, tr("complete"))
                 entry["tw"].setText(5, "")
+                entry["tw"].setText(6, "")
                 entry["pb"].setValue(1000)
                 entry["pb"].setStyleSheet(
                     "QProgressBar::chunk { background-color: #4caf50; border-radius: 3px; }"
                 )
             else:
                 if entry["status"] == "Cancelled":
-                    entry["tw"].setText(6, tr("cancelled"))
+                    entry["tw"].setText(7, tr("cancelled"))
                 elif entry.get("retry_count", 0) < 3:
                     entry["retry_count"] = entry.get("retry_count", 0) + 1
                     n = entry["retry_count"]
                     entry["status"] = "Queued"
-                    entry["tw"].setText(6, tr("retrying", n=n))
-                    entry["tw"].setText(4, "")
+                    entry["tw"].setText(7, tr("retrying", n=n))
                     entry["tw"].setText(5, "")
+                    entry["tw"].setText(6, "")
                     entry["pb"].setValue(0)
                     entry["pb"].setStyleSheet("")
                     self._update_status_count()
@@ -2684,9 +3829,9 @@ if HAS_GUI:
                     return
                 else:
                     entry["status"] = "Failed"
-                    entry["tw"].setText(6, tr("failed"))
-                entry["tw"].setText(4, "")
+                    entry["tw"].setText(7, tr("failed"))
                 entry["tw"].setText(5, "")
+                entry["tw"].setText(6, "")
                 entry["pb"].setStyleSheet(
                     "QProgressBar::chunk { background-color: #c0392b; border-radius: 3px; }"
                 )
@@ -2702,7 +3847,7 @@ if HAS_GUI:
                 entry["worker"].cancel()
             elif entry["status"] == "Queued":
                 entry["status"] = "Cancelled"
-                entry["tw"].setText(6, tr("cancelled"))
+                entry["tw"].setText(7, tr("cancelled"))
                 self._update_status_count()
 
         def _remove_entry(self, entry, animate=True):
@@ -2760,10 +3905,10 @@ if HAS_GUI:
             if entry["status"] == "Downloading" and "worker" in entry:
                 entry["worker"].pause()
                 entry["status"] = "Paused"
-                entry["tw"].setText(6, tr("paused"))
+                entry["tw"].setText(7, tr("paused"))
             elif entry["status"] == "Queued":
                 entry["status"] = "Paused"
-                entry["tw"].setText(6, tr("paused"))
+                entry["tw"].setText(7, tr("paused"))
 
         def _resume_entry(self, entry):
             if entry["status"] != "Paused":
@@ -2772,11 +3917,11 @@ if HAS_GUI:
                 # 활성 worker 있음 → resume
                 entry["worker"].resume()
                 entry["status"] = "Downloading"
-                entry["tw"].setText(6, tr("downloading"))
+                entry["tw"].setText(7, tr("downloading"))
             else:
                 # worker 없음 (앱 재시작 등) → Queued로 변경하여 재다운로드
                 entry["status"] = "Queued"
-                entry["tw"].setText(6, tr("queued"))
+                entry["tw"].setText(7, tr("queued"))
                 entry["pb"].setValue(0)
                 entry["pb"].setStyleSheet("")
                 self._process_queue()
@@ -2790,7 +3935,7 @@ if HAS_GUI:
                     self._pause_entry(entry)
                 elif entry["status"] == "Queued":
                     entry["status"] = "Paused"
-                    entry["tw"].setText(6, tr("paused"))
+                    entry["tw"].setText(7, tr("paused"))
 
         def _resume_selected(self):
             """체크된 항목 재개"""
@@ -2823,7 +3968,16 @@ if HAS_GUI:
             for e in self._dl_queue:
                 e["tw"].setCheckState(0, state)
 
+        def _update_row_numbers(self):
+            """dl_tree의 # 컬럼(index 1)에 행 번호 표시"""
+            for i in range(self.dl_tree.topLevelItemCount()):
+                item = self.dl_tree.topLevelItem(i)
+                if item:
+                    item.setText(1, str(i + 1))
+                    item.setTextAlignment(1, Qt.AlignmentFlag.AlignCenter)
+
         def _update_status_count(self):
+            self._update_row_numbers()
             queued = sum(1 for e in self._dl_queue if e["status"] == "Queued")
             active = sum(1 for e in self._dl_queue if e["status"] == "Downloading")
             done = sum(1 for e in self._dl_queue if e["status"] == "Complete")
@@ -2835,6 +3989,42 @@ if HAS_GUI:
                     tr("queue_stat", t=total, a=active, q=queued, d=done)
                 )
             self._update_tray_status()
+
+        def _move_entry_to_top(self, entry):
+            """대기/일시정지 항목을 Downloading 항목 바로 뒤로 이동 (우선 다운로드)"""
+            if entry["status"] not in ("Queued", "Paused"):
+                return
+            # _dl_queue에서 제거
+            if entry in self._dl_queue:
+                self._dl_queue.remove(entry)
+            # Downloading 항목들 바로 뒤에 삽입
+            insert_idx = 0
+            for i, e in enumerate(self._dl_queue):
+                if e["status"] == "Downloading":
+                    insert_idx = i + 1
+            self._dl_queue.insert(insert_idx, entry)
+
+            # dl_tree에서도 이동
+            tw = entry["tw"]
+            tree_idx = self.dl_tree.indexOfTopLevelItem(tw)
+            if tree_idx >= 0:
+                self.dl_tree.takeTopLevelItem(tree_idx)
+            # tree에서도 Downloading 항목 뒤에 삽입
+            tree_insert = 0
+            for i in range(self.dl_tree.topLevelItemCount()):
+                item = self.dl_tree.topLevelItem(i)
+                for e in self._dl_queue:
+                    if e["tw"] is item and e["status"] == "Downloading":
+                        tree_insert = i + 1
+                        break
+            self.dl_tree.insertTopLevelItem(tree_insert, tw)
+            # 프로그레스바 위젯 재부착
+            pb = entry.get("pb")
+            if pb:
+                self.dl_tree.setItemWidget(tw, 4, pb)
+            self._update_row_numbers()
+            self.dl_tree.scrollToItem(tw)
+            self._flash_item(tw)
 
         def _queue_context_menu(self, pos):
             """다운로드 큐 우클릭 메뉴"""
@@ -2856,14 +4046,17 @@ if HAS_GUI:
             cancel_act = None
             remove_act = None
             folder_act = None
+            priority_act = None
 
             if st == "Downloading":
                 pause_act = menu.addAction(tr("pause"))
                 cancel_act = menu.addAction(tr("cancel"))
             elif st == "Paused":
                 resume_act = menu.addAction(tr("resume"))
+                priority_act = menu.addAction(tr("priority_download"))
                 cancel_act = menu.addAction(tr("cancel"))
             elif st == "Queued":
+                priority_act = menu.addAction(tr("priority_download"))
                 cancel_act = menu.addAction(tr("cancel"))
             if st in ("Complete", "Failed", "Cancelled"):
                 remove_act = menu.addAction(tr("remove"))
@@ -2877,6 +4070,8 @@ if HAS_GUI:
                 self._pause_entry(entry)
             elif action == resume_act:
                 self._resume_entry(entry)
+            elif action == priority_act:
+                self._move_entry_to_top(entry)
             elif action == cancel_act:
                 self._cancel_entry(entry)
             elif action == remove_act:
@@ -2894,12 +4089,12 @@ if HAS_GUI:
 
             # 다운로드 큐에 상태 표시 행 추가
             tw = QTreeWidgetItem()
-            tw.setText(1, f"🔗 {url[:50]}...")
-            tw.setText(2, "-")
-            tw.setText(3, "")
+            tw.setText(2, f"🔗 {url[:50]}...")
+            tw.setText(3, "-")
             tw.setText(4, "")
             tw.setText(5, "")
-            tw.setText(6, tr("processing_share"))
+            tw.setText(6, "")
+            tw.setText(7, tr("processing_share"))
             self.dl_tree.addTopLevelItem(tw)
             self._share_log_tw = tw
 
@@ -2934,7 +4129,7 @@ if HAS_GUI:
             """공유 링크 처리 로그를 다운로드 큐 행에 표시"""
             self.status.showMessage(msg)
             if hasattr(self, '_share_log_tw') and self._share_log_tw:
-                self._share_log_tw.setText(6, msg)
+                self._share_log_tw.setText(7, msg)
 
         def _open_share_dialog(self, initial_url=""):
             if not self.bduss:
@@ -2978,6 +4173,344 @@ if HAS_GUI:
                 QMessageBox.warning(self, tr("failed"),
                     f"{tr('save_failed')}\n\n{err}")
 
+        # ── Bilibili 다운로드 ─────────────────────────────────────────────────
+
+        def _open_bili_dialog(self, initial_url=""):
+            dlg = QDialog(self)
+            dlg.setWindowTitle(tr("bili_download"))
+            dlg.setMinimumWidth(500)
+            lay = QVBoxLayout(dlg)
+
+            # URL 입력
+            url_row = QHBoxLayout()
+            url_label = QLabel("URL:")
+            self._bili_url = QLineEdit()
+            if initial_url:
+                self._bili_url.setText(initial_url)
+            self._bili_url.setPlaceholderText("https://www.bilibili.com/video/BVxxxxxxxx")
+            url_row.addWidget(url_label)
+            url_row.addWidget(self._bili_url)
+            lay.addLayout(url_row)
+
+            # SESSDATA 입력 (선택사항 — VIP 계정이면 4K 가능)
+            sess_row = QHBoxLayout()
+            sess_label = QLabel("SESSDATA:")
+            self._bili_sessdata = QLineEdit()
+            self._bili_sessdata.setPlaceholderText(tr("bili_sessdata_hint"))
+            self._bili_sessdata.setEchoMode(QLineEdit.EchoMode.Password)
+            cfg = load_config()
+            saved_sess = cfg.get("bili_sessdata", "")
+            if saved_sess:
+                self._bili_sessdata.setText(saved_sess)
+            sess_row.addWidget(sess_label)
+            sess_row.addWidget(self._bili_sessdata)
+            lay.addLayout(sess_row)
+
+            # 분석 버튼
+            self._bili_analyze_btn = QPushButton(tr("bili_analyze"))
+            self._bili_analyze_btn.clicked.connect(lambda: self._bili_analyze(dlg))
+            lay.addWidget(self._bili_analyze_btn)
+
+            # 정보 표시
+            self._bili_info = QLabel("")
+            self._bili_info.setWordWrap(True)
+            self._bili_info.setStyleSheet("font-size: 12px; padding: 4px;")
+            lay.addWidget(self._bili_info)
+
+            # 화질 선택
+            quality_row = QHBoxLayout()
+            quality_row.addWidget(QLabel(tr("bili_quality") + ":"))
+            self._bili_quality = QComboBox()
+            quality_row.addWidget(self._bili_quality)
+            quality_row.addStretch()
+            lay.addLayout(quality_row)
+
+            # 다운로드 버튼
+            btn_row = QHBoxLayout()
+            btn_row.addStretch()
+            self._bili_dl_btn = QPushButton(tr("download"))
+            self._bili_dl_btn.setEnabled(False)
+            self._bili_dl_btn.clicked.connect(lambda: self._bili_start_download(dlg))
+            btn_row.addWidget(self._bili_dl_btn)
+            cancel_btn = QPushButton(tr("cancel"))
+            cancel_btn.clicked.connect(dlg.reject)
+            btn_row.addWidget(cancel_btn)
+            lay.addLayout(btn_row)
+
+            self._bili_streams = None
+            self._bili_video_info = None
+
+            if initial_url and bili_parse_url(initial_url):
+                from PySide6.QtCore import QTimer
+                QTimer.singleShot(200, lambda: self._bili_analyze(dlg))
+            dlg.exec()
+
+        def _bili_analyze(self, dlg):
+            url = self._bili_url.text().strip()
+            bvid = bili_parse_url(url)
+            if not bvid:
+                self._bili_info.setText("Invalid Bilibili URL")
+                return
+            self._bili_analyze_btn.setEnabled(False)
+            self._bili_info.setText(tr("bili_analyzing"))
+            self._bili_quality.clear()
+
+            class _Worker(QThread):
+                done = Signal(object, object)
+                def __init__(self, bvid, sessdata=""):
+                    super().__init__()
+                    self.bvid = bvid
+                    self.sessdata = sessdata
+                def run(self):
+                    s = _bili_session()
+                    info = bili_get_video_info(self.bvid, s)
+                    streams = None
+                    if info:
+                        streams = bili_get_streams(
+                            self.bvid, info["cid"], s,
+                            sessdata=self.sessdata or None)
+                    self.done.emit(info, streams)
+
+            sessdata = self._bili_sessdata.text().strip()
+            # SESSDATA 저장
+            if sessdata:
+                cfg = load_config()
+                cfg["bili_sessdata"] = sessdata
+                save_config(cfg)
+            self._bili_worker = _Worker(bvid, sessdata)
+            def _on_done(info, streams):
+                self._bili_analyze_btn.setEnabled(True)
+                if not info:
+                    self._bili_info.setText("Failed to get video info")
+                    return
+                if not streams:
+                    self._bili_info.setText("Failed to get streams")
+                    return
+                self._bili_video_info = info
+                self._bili_streams = streams
+                dur = info["duration"]
+                dur_str = f"{dur // 60}:{dur % 60:02d}"
+                has_vip_q = any(v["qn"] >= 112 for v in streams["video"])
+                info_html = f"<b>{info['title']}</b><br>Duration: {dur_str}"
+                if has_vip_q:
+                    info_html += " | <font color='green'>VIP streams available</font>"
+                else:
+                    info_html += " | Max 1080P (SESSDATA for 4K)"
+                self._bili_info.setText(info_html)
+                # 화질 목록 — 중복 제거, 최고 화질 우선
+                seen = set()
+                sorted_vids = sorted(streams["video"], key=lambda x: x["qn"], reverse=True)
+                for v in sorted_vids:
+                    qn = v["qn"]
+                    if qn in seen:
+                        continue
+                    seen.add(qn)
+                    codec = v.get("codec", "")
+                    size_str = format_size(v["size"]) if v.get("size") else ""
+                    label = f"{_bili_qn_label(qn)} ({v['width']}x{v['height']}) [{codec}]"
+                    if size_str:
+                        label += f" {size_str}"
+                    vip = v.get("need_vip", False)
+                    if vip:
+                        label += " (VIP)"
+                    self._bili_quality.addItem(label, qn)
+                if self._bili_quality.count() > 0:
+                    self._bili_dl_btn.setEnabled(True)
+
+            self._bili_worker.done.connect(_on_done)
+            self._bili_worker.start()
+
+        def _bili_start_download(self, dlg):
+            if not self._bili_streams or not self._bili_video_info:
+                return
+            qn = self._bili_quality.currentData()
+            info = self._bili_video_info
+            streams = self._bili_streams
+
+            # 선택된 화질의 스트림 찾기 (AVC 우선, 없으면 HEVC/AV1)
+            video_stream = None
+            candidates = [v for v in streams["video"] if v["qn"] == qn]
+            for prefer in ["avc", "hevc", "av1"]:
+                for v in candidates:
+                    if prefer in v.get("codec", ""):
+                        video_stream = v
+                        break
+                if video_stream:
+                    break
+            if not video_stream and candidates:
+                video_stream = candidates[0]
+            if not video_stream:
+                QMessageBox.warning(self, "Error", "Video stream not found")
+                return
+            # 최고 비트레이트 오디오
+            audio_stream = max(streams["audio"], key=lambda a: a["bandwidth"]) if streams["audio"] else None
+            if not audio_stream:
+                QMessageBox.warning(self, "Error", "Audio stream not found")
+                return
+
+            # ffmpeg 확인
+            if not bili_check_ffmpeg():
+                QMessageBox.warning(self, "ffmpeg", tr("bili_no_ffmpeg"))
+                return
+
+            # 저장 경로
+            cfg = load_config()
+            dl_dir = cfg.get("download_dir", os.path.join(os.path.expanduser("~"), "Downloads"))
+            safe_title = re.sub(r'[\\/*?:"<>|]', "_", info["title"])[:100]
+            qn_label = _bili_qn_label(qn)
+            output_name = f"{safe_title}_{qn_label}.mp4"
+            output_path = os.path.join(dl_dir, output_name)
+
+            dlg.accept()
+
+            # 큐에 추가
+            tw = QTreeWidgetItem()
+            tw.setCheckState(0, Qt.CheckState.Unchecked)
+            tw.setTextAlignment(0, Qt.AlignmentFlag.AlignCenter)
+            tw.setText(2, f"[B] {info['title']}")
+            total_size = (video_stream.get("size", 0) or 0) + (audio_stream.get("size", 0) or 0)
+            tw.setText(3, format_size(total_size) if total_size else "")
+            tw.setText(7, "Downloading")
+            self.dl_tree.addTopLevelItem(tw)
+
+            pb = QProgressBar()
+            pb.setRange(0, 1000)
+            pb.setValue(0)
+            self.dl_tree.setItemWidget(tw, 4, pb)
+
+            entry = {
+                "type": "bilibili",
+                "filename": output_name,
+                "remote_path": f"bili:{info['bvid']}",
+                "output_path": output_path,
+                "total_size": total_size,
+                "status": "Downloading",
+                "tw": tw,
+                "pb": pb,
+                "_video_url": video_stream["url"],
+                "_audio_url": audio_stream["url"],
+                "_referer": f"https://www.bilibili.com/video/{info['bvid']}/",
+            }
+            self._dl_queue.append(entry)
+
+            # Bilibili 워커 시작
+            worker = BiliDownloadWorker(
+                video_stream["url"], audio_stream["url"],
+                output_path,
+                f"https://www.bilibili.com/video/{info['bvid']}/",
+            )
+            entry["worker"] = worker
+            worker.progress.connect(lambda d, t, s, e=entry: self._on_q_progress_entry(e, d, t, s))
+            worker.finished.connect(lambda ok, e=entry: self._on_bili_finished(e, ok))
+            worker.start()
+
+        def _on_bili_finished(self, entry, ok):
+            entry.pop("worker", None)
+            if ok:
+                entry["status"] = "Complete"
+                entry["tw"].setText(7, tr("complete"))
+                entry["tw"].setText(5, "")
+                entry["tw"].setText(6, "")
+                entry["pb"].setValue(1000)
+                entry["pb"].setStyleSheet(
+                    "QProgressBar::chunk { background-color: #4caf50; border-radius: 3px; }")
+            else:
+                entry["status"] = "Failed"
+                entry["tw"].setText(7, tr("failed"))
+                entry["pb"].setStyleSheet(
+                    "QProgressBar::chunk { background-color: #c0392b; border-radius: 3px; }")
+            self._update_status_count()
+
+        # ── Quark 다운로드 ───────────────────────────────────────────────────
+
+        def _open_quark_dialog(self, initial_url=""):
+            dlg = QuarkDialog(self, initial_url=initial_url)
+            dlg.files_selected.connect(self._quark_enqueue)
+            dlg.exec()
+
+        def _quark_enqueue(self, files, cookie_str):
+            """Quark 파일들을 다운로드 큐에 추가"""
+            out_dir = get_download_dir()
+            for f in files:
+                fname = f.get("file_name", f.get("filename", "?"))
+                fsize = f.get("size", 0)
+                fid = f.get("fid", "")
+                fid_token = f.get("share_fid_token", f.get("fid_token", ""))
+                pwd_id = f.get("_pwd_id", "")
+                stoken = f.get("_stoken", "")
+                output_path = os.path.join(out_dir, fname)
+
+                # 중복 체크
+                dup = None
+                for e in self._dl_queue:
+                    if (e.get("remote_path") == f"quark:{fid}"
+                            and e["status"] not in ("Complete", "Cancelled")
+                            and not e.get("_removing")):
+                        dup = e
+                        break
+                if dup:
+                    self._flash_item_warn(dup["tw"])
+                    continue
+
+                tw = QTreeWidgetItem()
+                tw.setCheckState(0, Qt.CheckState.Unchecked)
+                tw.setTextAlignment(0, Qt.AlignmentFlag.AlignCenter)
+                tw.setText(2, f"[Q] {fname}")
+                tw.setText(3, format_size(fsize))
+                tw.setText(7, tr("queued"))
+                self.dl_tree.addTopLevelItem(tw)
+
+                pb = QProgressBar()
+                pb.setRange(0, 1000)
+                pb.setValue(0)
+                pb.setFormat("%p%")
+                pb.setFixedHeight(18)
+                self.dl_tree.setItemWidget(tw, 4, pb)
+
+                entry = {
+                    "type": "quark",
+                    "remote_path": f"quark:{fid}",
+                    "output_path": output_path,
+                    "filename": fname,
+                    "total_size": fsize,
+                    "status": "Queued",
+                    "tw": tw,
+                    "pb": pb,
+                    "_quark_fid": fid,
+                    "_quark_fid_token": fid_token,
+                    "_quark_pwd_id": pwd_id,
+                    "_quark_stoken": stoken,
+                    "_quark_cookie": cookie_str,
+                }
+                self._dl_queue.append(entry)
+                self._flash_item(tw)
+
+            self._update_status_count()
+            self._save_queue()
+            self._process_queue()
+
+        def _start_quark_entry(self, entry):
+            """Quark 개별 항목 다운로드 시작"""
+            entry["status"] = "Downloading"
+            entry["tw"].setText(7, tr("downloading"))
+            self._dl_active.append(entry)
+
+            worker = QuarkDownloadWorker(
+                entry["_quark_fid"],
+                entry["_quark_fid_token"],
+                entry["_quark_pwd_id"],
+                entry["_quark_stoken"],
+                entry["_quark_cookie"],
+                entry["output_path"],
+                entry["total_size"],
+                entry["filename"],
+            )
+            entry["worker"] = worker
+            worker.progress.connect(lambda d, t, s, e=entry: self._on_q_progress_entry(e, d, t, s))
+            worker.finished.connect(lambda ok, e=entry: self._on_q_finished_entry(e, ok))
+            worker.start()
+            self.status.showMessage(f"Downloading: {entry['filename']}")
+
         # ── 설정 ─────────────────────────────────────────────────────────────
 
         def _open_settings(self):
@@ -2996,6 +4529,8 @@ if HAS_GUI:
             self.act_settings.setText(tr("settings"))
             self.act_update.setText(tr("check_update"))
             self.act_quit.setText(tr("tray_quit"))
+            self.act_bili.setText(tr("bili_download"))
+            self.act_quark.setText(tr("quark_download"))
             self.logout_btn.setText(tr("logout"))
             self.tree.setHeaderLabels([tr("name"), tr("size"), tr("modified")])
             self.q_title.setText(tr("downloads"))
@@ -3004,18 +4539,40 @@ if HAS_GUI:
             self.del_sel_btn.setText(f"  {tr('delete_selected')}")
             self.clear_btn.setText(f"  {tr('clear_done')}")
             self.dl_tree.setHeaderLabels([
-                "", tr("name"), tr("size"), tr("progress"),
+                "", "#", tr("name"), tr("size"), tr("progress"),
                 tr("speed"), tr("eta"), tr("status")])
             self._update_status_count()
 
+        @staticmethod
+        def _detect_link_type(text):
+            """클립보드 텍스트에서 서비스 유형 감지
+            Returns: ("baidu", url) | ("bilibili", url) | ("quark", url) | (None, None)
+            """
+            url = text.split('\n')[0].strip()
+            if "pan.baidu.com" in url or "baidu.com/s/" in url:
+                return "baidu", url
+            if "bilibili.com/video/" in url or "b23.tv/" in url:
+                return "bilibili", url
+            if "pan.quark.cn/s/" in url:
+                return "quark", url
+            return None, None
+
         def keyPressEvent(self, event):
-            """Ctrl+V로 공유링크 붙여넣으면 바로 처리 (Hitomi 방식)"""
+            """Ctrl+V로 공유링크 붙여넣으면 바로 해당 서비스 다이얼로그 열기"""
             if event.modifiers() == Qt.KeyboardModifier.ControlModifier and event.key() == Qt.Key.Key_V:
                 clipboard = QApplication.clipboard()
                 text = clipboard.text().strip()
-                if text and ("pan.baidu.com" in text or "baidu.com/s/" in text):
-                    self._paste_share_link(text)
-                    return
+                if text:
+                    svc, url = self._detect_link_type(text)
+                    if svc == "baidu":
+                        self._paste_share_link(text)
+                        return
+                    elif svc == "bilibili":
+                        self._open_bili_dialog(initial_url=url)
+                        return
+                    elif svc == "quark":
+                        self._open_quark_dialog(initial_url=url)
+                        return
             super().keyPressEvent(event)
 
         def _paste_share_link(self, text):
@@ -3043,7 +4600,7 @@ if HAS_GUI:
                 self._open_share_dialog(initial_url=url)
 
         def _logout(self):
-            """BDUSS 초기화 후 메인창 닫고 로그인 창으로 돌아감"""
+            """BDUSS 삭제 후 UI 초기화 (설정에서 재입력 안내)"""
             reply = QMessageBox.question(
                 self, tr("logout"), tr("logout_confirm"),
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
@@ -3052,6 +4609,7 @@ if HAS_GUI:
                 return
             cfg = load_config()
             cfg.pop("bduss", None)
+            cfg.pop("bduss_enc", None)
             cfg["auto_login"] = False
             save_config(cfg)
 
@@ -3060,23 +4618,8 @@ if HAS_GUI:
             self.current_path = "/"
             self.path_label.setText("Baiduyun: /")
             self.user_label.setText(tr("not_logged_in"))
-
-            # 메인창 숨기고 로그인 다이얼로그
-            self.hide()
-            dlg = LoginDialog()
-            if dlg.exec() == QDialog.DialogCode.Accepted:
-                cfg = load_config()
-                cfg["bduss"] = dlg.bduss_value
-                cfg["auto_login"] = dlg.auto_login
-                save_config(cfg)
-                self.set_login(dlg.bduss_value, dlg.login_info)
-                self.show()
-                self.raise_()
-                self.activateWindow()
-            else:
-                # 로그인 취소 → 앱 종료
-                self._really_quit = True
-                self.close()
+            self.quota_label.setVisible(False)
+            self.status.showMessage(tr("logged_out"))
 
         # ── 자동 업데이트 ─────────────────────────────────────────────────────
 
@@ -3407,36 +4950,8 @@ QPushButton { padding: 5px 14px; border-radius: 4px; }
 """
 
 
-def _login_flow(app):
-    """로그인 처리. 성공 시 (bduss, info) 반환, 실패/취소 시 None 반환."""
-    cfg = load_config()
-    bduss = cfg.get("bduss")
-
-    # 자동 로그인이 켜져있고 저장된 BDUSS가 있으면 검증
-    if cfg.get("auto_login") and bduss:
-        info = verify_login(bduss)
-        if info:
-            return bduss, info
-
-    # 로그인 다이얼로그 반복 (검증은 다이얼로그 내부에서 처리)
-    while True:
-        dlg = LoginDialog()
-        if dlg.exec() == QDialog.DialogCode.Accepted:
-            cfg["bduss"] = dlg.bduss_value
-            cfg["auto_login"] = dlg.auto_login
-            save_config(cfg)
-            return dlg.bduss_value, dlg.login_info
-
-        reply = QMessageBox.question(
-            None, tr("login_required"), tr("login_required_msg"),
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-        )
-        if reply != QMessageBox.StandardButton.Yes:
-            return None
-
-
 def main_gui():
-    """PySide6 GUI 모드"""
+    """PySide6 GUI 모드 — 로그인 없이 즉시 메인 윈도우 표시"""
     _init_lang()
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
@@ -3446,15 +4961,7 @@ def main_gui():
     else:
         app.setStyleSheet(_LIGHT_QSS)
 
-    # 로그인 먼저 처리 - 성공해야만 메인 창 열림
-    login_result = _login_flow(app)
-    if login_result is None:
-        sys.exit(0)
-
-    bduss, info = login_result
-
     window = BaiduDownloaderWindow()
-    window.set_login(bduss, info)
     # 화면 중앙에 배치
     screen = app.primaryScreen().geometry()
     x = (screen.width() - window.width()) // 2
@@ -3463,6 +4970,10 @@ def main_gui():
     window.show()
     window.raise_()
     window.activateWindow()
+
+    # 비동기 자동 로그인
+    window._try_auto_login()
+
     sys.exit(app.exec())
 
 
