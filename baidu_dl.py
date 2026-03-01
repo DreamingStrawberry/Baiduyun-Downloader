@@ -518,7 +518,7 @@ def _download_sequential(bduss, remote_path, output_path, total_size,
                 try:
                     chunk_start = time.time()
                     chunk_downloaded = 0
-                    r = requests.get(redirect_url, headers=headers, timeout=60, stream=True)
+                    r = requests.get(dl_url, headers=headers, timeout=60, stream=True)
                     if r.status_code in (200, 206):
                         for piece in r.iter_content(chunk_size=65536):
                             if cancel_flag and cancel_flag():
